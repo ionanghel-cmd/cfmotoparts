@@ -2,7 +2,7 @@ import io
 import re
 import sqlite3
 from datetime import datetime
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import pdfplumber
 import requests
@@ -45,10 +45,20 @@ def init_db(conn: sqlite3.Connection) -> None:
             cantitate_primita REAL DEFAULT 0.0,
             data_primire TEXT,
             status TEXT DEFAULT 'asteptata',
+            pret_unitar REAL,
+            disponibilitate_plasare TEXT,
             FOREIGN KEY (comanda_id) REFERENCES comenzi(id)
         )
         """
     )
+
+    cursor.execute("PRAGMA table_info(piese)")
+    cols = {row[1] for row in cursor.fetchall()}
+    if "pret_unitar" not in cols:
+        cursor.execute("ALTER TABLE piese ADD COLUMN pret_unitar REAL")
+    if "disponibilitate_plasare" not in cols:
+        cursor.execute("ALTER TABLE piese ADD COLUMN disponibilitate_plasare TEXT")
+
     conn.commit()
 
 
@@ -192,8 +202,8 @@ def import_orders_from_account(
     orders_url: str = ORDERS_URL,
     limit: int = 20,
 ):
-    session, orders_html = login_and_fetch_orders_html(username, password, orders_url)
-    order_links = extract_order_links(orders_html)
+    session, _ = login_and_fetch_orders_html(username, password, orders_url)
+    order_links = _collect_order_links_from_pages(session, orders_url, limit=limit, max_pages=120)
     return _import_order_links_into_db(conn, session, order_links, limit)
 
 
@@ -203,9 +213,79 @@ def import_orders_from_cookie(
     orders_url: str = ORDERS_URL,
     limit: int = 20,
 ):
-    session, orders_html = fetch_orders_html_with_cookie(orders_url, cookie_header)
-    order_links = extract_order_links(orders_html)
+    session, _ = fetch_orders_html_with_cookie(orders_url, cookie_header)
+    order_links = _collect_order_links_from_pages(session, orders_url, limit=limit, max_pages=120)
     return _import_order_links_into_db(conn, session, order_links, limit)
+
+
+def _normalize_order_page_url(base_orders_url: str, page: int):
+    parsed = urlparse(base_orders_url)
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    query["page"] = [str(page)]
+    new_query = urlencode(query, doseq=True)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+
+
+def _collect_order_links_from_pages(session: requests.Session, orders_url: str, limit: int, max_pages: int = 50):
+    all_links = []
+    seen = set()
+
+    pages_to_scan = max(1, min(max_pages, (limit // 20) + 2))
+    for page in range(pages_to_scan):
+        page_url = _normalize_order_page_url(orders_url, page)
+        resp = session.get(page_url, timeout=30)
+        resp.raise_for_status()
+        page_links = extract_order_links(resp.text)
+
+        if not page_links and page > 0:
+            break
+
+        added_this_page = 0
+        for link in page_links:
+            if link not in seen:
+                seen.add(link)
+                all_links.append(link)
+                added_this_page += 1
+                if len(all_links) >= limit:
+                    return all_links
+
+        if page > 0 and added_this_page == 0:
+            break
+
+    return all_links
+
+
+def _extract_availability(text: str):
+    lowered = text.lower()
+    if "not in stock" in lowered:
+        m = re.search(r"not in stock[^\n]*", text, flags=re.I)
+        return m.group(0).strip() if m else "not in stock"
+    if "sufficient stock" in lowered:
+        return "sufficient stock"
+    return ""
+
+
+def _extract_price_from_text(text: str):
+    m = re.search(r"(\d+[\d.,]*)\s*€", text)
+    if not m:
+        m = re.search(r"€\s*(\d+[\d.,]*)", text)
+    if not m:
+        return None
+
+    raw = m.group(1).replace(" ", "")
+    if "," in raw and "." in raw:
+        # keep the last separator as decimal marker
+        if raw.rfind(",") > raw.rfind("."):
+            raw = raw.replace(".", "").replace(",", ".")
+        else:
+            raw = raw.replace(",", "")
+    elif "," in raw:
+        raw = raw.replace(",", ".")
+
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
 def parse_html_and_insert(conn: sqlite3.Connection, html_text: str):
@@ -235,26 +315,27 @@ def parse_html_and_insert(conn: sqlite3.Connection, html_text: str):
         for row in table.find("tbody").find_all("tr"):
             cols = row.find_all("td")
             if len(cols) >= 4:
-                nume = (
-                    cols[1]
-                    .text.strip()
-                    .replace("\n", " ")
-                    .replace("sufficient stock", "")
-                    .strip()
-                )
+                raw_desc = cols[1].get_text(" ", strip=True)
+                disponibilitate = _extract_availability(raw_desc)
+                nume = raw_desc.replace("sufficient stock", "").strip()
                 cod_match = re.search(r"\(([\w-]+)\)", nume)
                 cod = cod_match.group(1) if cod_match else ""
+
+                qty_cell = cols[3].get_text(" ", strip=True) if len(cols) > 3 else "1"
                 try:
-                    cant = float(cols[3].text.strip())
+                    cant = float(re.sub(r"[^0-9.,-]", "", qty_cell).replace(",", ".") or "1")
                 except (ValueError, TypeError):
                     cant = 1.0
 
+                price_text = " ".join(c.get_text(" ", strip=True) for c in cols)
+                pret = _extract_price_from_text(price_text)
+
                 cursor.execute(
                     """
-                    INSERT INTO piese (comanda_id, nume_piesa, cod, cantitate, status)
-                    VALUES (?, ?, ?, ?, 'asteptata')
+                    INSERT INTO piese (comanda_id, nume_piesa, cod, cantitate, status, pret_unitar, disponibilitate_plasare)
+                    VALUES (?, ?, ?, ?, 'asteptata', ?, ?)
                     """,
-                    (comanda_id, nume, cod, cant),
+                    (comanda_id, nume, cod, cant, pret, disponibilitate),
                 )
                 added += 1
 
@@ -405,6 +486,25 @@ def get_raport_asteptate(conn: sqlite3.Connection):
     return cursor.fetchall()
 
 
+
+
+def search_piesa_in_comenzi(conn: sqlite3.Connection, cod_query: str):
+    cursor = conn.cursor()
+    pattern = f"%{cod_query.strip()}%"
+    cursor.execute(
+        """
+        SELECT c.order_number, c.data_plasare, p.cod, p.nume_piesa, p.cantitate,
+               p.pret_unitar, p.disponibilitate_plasare
+        FROM piese p
+        JOIN comenzi c ON c.id = p.comanda_id
+        WHERE p.cod LIKE ?
+        ORDER BY c.data_plasare DESC, c.order_number DESC
+        """,
+        (pattern,),
+    )
+    return cursor.fetchall()
+
+
 def format_piese_rows(rows):
     def row_get(row, key, idx, default=None):
         if isinstance(row, sqlite3.Row):
@@ -491,7 +591,7 @@ def main():
 
     with st.form("cfmoto_sync_form"):
         sync_orders_url = st.text_input("URL listă comenzi", value=ORDERS_URL)
-        sync_limit = st.number_input("Număr maxim comenzi de importat", min_value=1, max_value=200, value=25, step=1)
+        sync_limit = st.number_input("Număr maxim comenzi de importat", min_value=1, max_value=1000, value=200, step=1)
 
         if sync_mode == "Login direct (fără CAPTCHA)":
             sync_user = st.text_input("User / Email cfmotoparts.eu")
@@ -540,7 +640,7 @@ def main():
             except Exception as exc:
                 st.error(f"Eroare la sincronizare: {exc}")
 
-    tab1, tab2, tab3 = st.tabs(["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Raport așteptate"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Raport așteptate", "Căutare cod piesă"])
 
     with tab1:
         rows = get_comenzi(conn, "plasata")
@@ -600,9 +700,34 @@ def main():
                 lines.append(f"- {status_color} {r['nume_piesa']} ({cod}) — lipsă {r['lipsa']:.0f} buc")
             st.markdown("\n".join(lines))
 
+
+    with tab4:
+        st.subheader("Caută cod piesă în toate comenzile")
+        cod_query = st.text_input("Cod piesă căutat", key="global_cod_query")
+        if cod_query.strip():
+            results = search_piesa_in_comenzi(conn, cod_query)
+            if not results:
+                st.info("Nu am găsit codul în comenzile importate.")
+            else:
+                st.dataframe(
+                    [
+                        {
+                            "Nr comandă": r["order_number"],
+                            "Data comandă": r["data_plasare"],
+                            "Cod piesă": r["cod"],
+                            "Denumire": r["nume_piesa"],
+                            "Unități comandate": float(r["cantitate"]),
+                            "Preț unitar": r["pret_unitar"],
+                            "Disponibilitate la plasare": r["disponibilitate_plasare"] or "-",
+                        }
+                        for r in results
+                    ],
+                    use_container_width=True,
+                )
+
     st.caption(
-        "Pentru conturi cu CAPTCHA, aplicația nu rezolvă CAPTCHA automat. "
-        "Fă login manual în browser și folosește importul cu cookie de sesiune."
+        "Pentru import masiv (până la 1000), aplicația parcurge și paginile următoare din orders (?page=1,2,3...). "
+        "Pentru conturi cu CAPTCHA, fă login manual în browser și folosește importul cu cookie de sesiune."
     )
 
     conn.close()

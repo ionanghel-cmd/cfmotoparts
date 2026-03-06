@@ -39,3 +39,5 @@ Dacă publici doar acolo (ex: `ionanghel-cmd.github.io/cfmotoparts`), upload-ul 
   1. `Login direct (fără CAPTCHA)` – pentru conturi/sesiuni unde loginul nu cere CAPTCHA.
   2. `Cookie de sesiune (compatibil CAPTCHA)` – faci login manual în browser, apoi copiezi `Cookie` header în aplicație pentru import.
 - Rezolvarea automată CAPTCHA **nu este suportată**.
+- Importul poate scana automat paginile următoare de orders (`?page=1`, `?page=2`, etc.) și permite import masiv până la 1000 comenzi din UI.
+- Există tab nou `Căutare cod piesă` care caută codul în toate comenzile și arată: nr comandă, data comenzii, preț unitar, disponibilitate la plasare (`sufficient stock` / `not in stock; delivery ...`) și unitățile comandate.
