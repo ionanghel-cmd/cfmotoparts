@@ -9,6 +9,7 @@ Aplicație web (Streamlit) pentru monitorizarea comenzilor de piese CFMoto, impo
 - Separare pe tab-uri pentru comenzi plasate și invoice-uri viitoare
 - Detalii piese pe comandă + filtrare după cod/denumire
 - Raport piese în așteptare
+- Parser PDF mai tolerant pentru număr și dată factură
 
 ## Rulare locală
 ```bash
@@ -18,10 +19,15 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy online (GitHub + Streamlit Community Cloud)
+## Deploy online corect
+### Varianta recomandată: Streamlit Community Cloud
 1. Urcă proiectul pe GitHub.
 2. Intră pe https://share.streamlit.io
 3. Selectează repository-ul și fișierul `app.py`.
 4. Deploy.
 
-> Notă: baza de date SQLite e locală containerului de deploy. Pentru persistență reală multi-user recomand Postgres/Supabase.
+### Important despre GitHub Pages
+`github.io` (GitHub Pages) este hosting static și **nu poate rula aplicații Python/Streamlit**.
+Dacă publici doar acolo (ex: `ionanghel-cmd.github.io/cfmotoparts`), upload-ul nu va funcționa pentru această aplicație.
+
+> Notă: baza de date SQLite e locală instanței de deploy. Pentru persistență reală multi-user recomand Postgres/Supabase.
