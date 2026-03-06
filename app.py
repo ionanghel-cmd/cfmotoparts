@@ -1,4 +1,3 @@
-import io
 import re
 import sqlite3
 from datetime import datetime
@@ -10,13 +9,13 @@ from bs4 import BeautifulSoup
 DB_PATH = "comenzi.db"
 
 
-def get_connection() -> sqlite3.Connection:
+def get_connection():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn: sqlite3.Connection):
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -102,39 +101,17 @@ def parse_html_and_insert(conn: sqlite3.Connection, html_text: str):
     return order_number, added, "created"
 
 
-def _extract_invoice_number(text: str):
-    patterns = [
-        r"Serie/Numar:\s*([A-Z]{1,6}\s?[A-Z]{0,6}/\d+)",
-        r"Nr\.?\s*factura[:\s]*([A-Z0-9\-/]+)",
-        r"Invoice\s*(?:No\.?|#|Number)[:\s]*([A-Z0-9\-/]+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.I)
-        if match:
-            return match.group(1).strip()
-    return None
-
-
-def _extract_invoice_date(text: str):
-    patterns = [
-        r"Data:\s*(\d{2}\.\d{2}\.\d{4})",
-        r"Date:\s*(\d{2}[./-]\d{2}[./-]\d{4})",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.I)
-        if match:
-            return match.group(1).replace("/", ".").replace("-", ".")
-    return datetime.now().strftime("%d.%m.%Y")
-
-
 def parse_pdf_and_insert(conn: sqlite3.Connection, file_bytes: bytes):
     cursor = conn.cursor()
     added = 0
 
+    import io
+
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         text = "\n".join(page.extract_text() or "" for page in pdf.pages)
 
-    order_number = _extract_invoice_number(text)
+    nr = re.search(r"Serie/Numar:\s*(ATH CJ/\d+)", text, re.I)
+    order_number = nr.group(1) if nr else None
     if not order_number:
         raise ValueError("Nu am găsit numărul facturii în PDF.")
 
@@ -142,13 +119,16 @@ def parse_pdf_and_insert(conn: sqlite3.Connection, file_bytes: bytes):
     if cursor.fetchone():
         return order_number, 0, "exists"
 
-    data = _extract_invoice_date(text)
+    data_match = re.search(r"Data:\s*(\d{2}\.\d{2}\.\d{4})", text, re.I)
+    data = data_match.group(1) if data_match else datetime.now().strftime("%d.%m.%Y")
 
     cursor.execute(
         "INSERT INTO comenzi (order_number, data_plasare, tip, note) VALUES (?, ?, 'viitoare', 'Din PDF')",
         (order_number, data),
     )
     comanda_id = cursor.lastrowid
+
+    import io
 
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -158,37 +138,30 @@ def parse_pdf_and_insert(conn: sqlite3.Connection, file_bytes: bytes):
                 for row in table:
                     if not row:
                         continue
-                    if not header_skipped and "Nr" in str(row[0]):
+                    if not header_skipped and row and "Nr" in str(row[0]):
                         header_skipped = True
                         continue
 
-                    if len(row) < 5:
-                        continue
+                    if len(row) >= 6 and row[0] and re.match(r"^\d+$", str(row[0])):
+                        cod = str(row[1] or "").strip()
+                        den = str(row[2] or "").strip().replace("...nedefinita...", "").strip()
+                        nume = f"{cod} {den}".strip()
+                        cant_str = str(row[4] or "0").replace(",", ".")
 
-                    if not row[0] or not re.match(r"^\d+$", str(row[0]).strip()):
-                        continue
+                        try:
+                            cant = float(cant_str)
+                        except (ValueError, TypeError):
+                            cant = 1.0
 
-                    cod = str(row[1] or "").strip()
-                    den = str(row[2] or "").strip().replace("...nedefinita...", "").strip()
-                    nume = f"{cod} {den}".strip()
-
-                    cant_idx = 4 if len(row) > 4 else 3
-                    cant_str = str(row[cant_idx] or "0").replace(",", ".")
-
-                    try:
-                        cant = float(re.sub(r"[^0-9.\-]", "", cant_str) or "0")
-                    except (ValueError, TypeError):
-                        cant = 1.0
-
-                    if cant > 0 and nume:
-                        cursor.execute(
-                            """
-                            INSERT INTO piese (comanda_id, nume_piesa, cod, cantitate, status)
-                            VALUES (?, ?, ?, ?, 'in_tranzit')
-                            """,
-                            (comanda_id, nume, cod, cant),
-                        )
-                        added += 1
+                        if cant > 0 and nume:
+                            cursor.execute(
+                                """
+                                INSERT INTO piese (comanda_id, nume_piesa, cod, cantitate, status)
+                                VALUES (?, ?, ?, ?, 'in_tranzit')
+                                """,
+                                (comanda_id, nume, cod, cant),
+                            )
+                            added += 1
 
     conn.commit()
     return order_number, added, "created"
@@ -245,10 +218,6 @@ def get_raport_asteptate(conn: sqlite3.Connection):
     return cursor.fetchall()
 
 
-def rows_to_dicts(rows):
-    return [dict(r) for r in rows]
-
-
 def main():
     st.set_page_config(page_title="Monitor Comenzi CFMoto Parts", layout="wide")
     st.title("Monitorizare Comenzi CFMOTO")
@@ -266,7 +235,6 @@ def main():
                 st.warning("Alege un fișier HTML.")
             else:
                 try:
-                    html_file.seek(0)
                     html_text = html_file.read().decode("utf-8", errors="ignore")
                     number, added, state = parse_html_and_insert(conn, html_text)
                     if state == "exists":
@@ -284,7 +252,6 @@ def main():
                 st.warning("Alege un fișier PDF.")
             else:
                 try:
-                    pdf_file.seek(0)
                     file_bytes = pdf_file.read()
                     number, added, state = parse_pdf_and_insert(conn, file_bytes)
                     if state == "exists":
@@ -298,45 +265,39 @@ def main():
 
     with tab1:
         rows = get_comenzi(conn, "plasata")
-        st.dataframe(
-            [
-                {
-                    "ID": row["id"],
-                    "Comandă": row["order_number"],
-                    "Data": row["data_plasare"],
-                    "Piese lipsă (buc)": int(row["lipsa"]),
-                }
-                for row in rows
-            ],
-            use_container_width=True,
-        )
+        st.dataframe([
+            {
+                "ID": row["id"],
+                "Comandă": row["order_number"],
+                "Data": row["data_plasare"],
+                "Piese lipsă (buc)": int(row["lipsa"]),
+            }
+            for row in rows
+        ], use_container_width=True)
 
         selected_id = st.number_input("Vezi detalii comandă (ID)", min_value=0, step=1, value=0, key="det_plasata")
         if selected_id > 0:
             query_text = st.text_input("Caută piesă (cod / denumire)", key="q_plasata")
             detalii = get_piese_for_comanda(conn, selected_id, query_text)
-            st.dataframe(rows_to_dicts(detalii), use_container_width=True)
+            st.dataframe(detalii, use_container_width=True)
 
     with tab2:
         rows = get_comenzi(conn, "viitoare")
-        st.dataframe(
-            [
-                {
-                    "ID": row["id"],
-                    "Factură": row["order_number"],
-                    "Data": row["data_plasare"],
-                    "Piese lipsă (buc)": int(row["lipsa"]),
-                }
-                for row in rows
-            ],
-            use_container_width=True,
-        )
+        st.dataframe([
+            {
+                "ID": row["id"],
+                "Factură": row["order_number"],
+                "Data": row["data_plasare"],
+                "Piese lipsă (buc)": int(row["lipsa"]),
+            }
+            for row in rows
+        ], use_container_width=True)
 
         selected_id = st.number_input("Vezi detalii factură (ID)", min_value=0, step=1, value=0, key="det_viitoare")
         if selected_id > 0:
             query_text = st.text_input("Caută piesă (cod / denumire)", key="q_viitoare")
             detalii = get_piese_for_comanda(conn, selected_id, query_text)
-            st.dataframe(rows_to_dicts(detalii), use_container_width=True)
+            st.dataframe(detalii, use_container_width=True)
 
     with tab3:
         rows = get_raport_asteptate(conn)
@@ -353,11 +314,6 @@ def main():
                 cod = r["cod"] or "fără cod"
                 lines.append(f"- {status_color} {r['nume_piesa']} ({cod}) — lipsă {r['lipsa']:.0f} buc")
             st.markdown("\n".join(lines))
-
-    st.caption(
-        "Dacă ai publicat pe GitHub Pages (ionanghel-cmd.github.io), aplicația Python nu poate rula acolo. "
-        "Folosește Streamlit Community Cloud pentru runtime Python."
-    )
 
     conn.close()
 
