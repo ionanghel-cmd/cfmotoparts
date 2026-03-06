@@ -139,9 +139,24 @@ def fetch_orders_html_with_cookie(orders_url: str, cookie_header: str):
     return session, response.text
 
 
-def extract_order_links(orders_html: str):
+def _extract_created_date_from_row_text(text: str):
+    text = " ".join(text.split())
+    patterns = [
+        r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s*\d{2}/\d{2}/\d{4}\s*-\s*\d{1,2}:\d{2}",
+        r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}\s*-\s*\d{1,2}:\d{2}",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            dt = _parse_cfmoto_datetime(m.group(0))
+            if dt:
+                return dt.strftime("%Y-%m-%d %H:%M")
+    return None
+
+
+def extract_order_entries(orders_html: str):
     soup = BeautifulSoup(orders_html, "html.parser")
-    links = []
+    entries = []
 
     order_patterns = [
         r"/user/\d+/orders/\d+",
@@ -149,37 +164,56 @@ def extract_order_links(orders_html: str):
         r"/order/\d+",
     ]
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        text = a.get_text(" ", strip=True)
-        if any(re.search(pattern, href) for pattern in order_patterns) or re.match(r"^\d{4}-\d+", text):
-            links.append(urljoin(BASE_URL, href))
+    for row in soup.select("table tr"):
+        row_text = row.get_text(" ", strip=True)
+        created_at = _extract_created_date_from_row_text(row_text)
+        for a in row.find_all("a", href=True):
+            href = a["href"]
+            text = a.get_text(" ", strip=True)
+            if any(re.search(pattern, href) for pattern in order_patterns) or re.match(r"^\d{4}-\d+", text):
+                entries.append({"link": urljoin(BASE_URL, href), "created_at": created_at})
+
+    if not entries:
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            text = a.get_text(" ", strip=True)
+            if any(re.search(pattern, href) for pattern in order_patterns) or re.match(r"^\d{4}-\d+", text):
+                entries.append({"link": urljoin(BASE_URL, href), "created_at": None})
 
     seen = set()
     deduped = []
-    for link in links:
-        if link not in seen:
-            deduped.append(link)
-            seen.add(link)
+    for e in entries:
+        if e["link"] not in seen:
+            deduped.append(e)
+            seen.add(e["link"])
     return deduped
 
 
-def _import_order_links_into_db(conn: sqlite3.Connection, session: requests.Session, order_links, limit: int):
-    if not order_links:
+def extract_order_links(orders_html: str):
+    return [e["link"] for e in extract_order_entries(orders_html)]
+
+
+def _import_order_links_into_db(conn: sqlite3.Connection, session: requests.Session, order_entries, limit: int):
+    if not order_entries:
         raise ValueError("Nu am găsit linkuri de comenzi în pagina de orders.")
 
     created_orders = 0
     existing_orders = 0
+    updated_orders = 0
     total_parts = 0
     errors = []
 
-    for link in order_links[:limit]:
+    for entry in order_entries[:limit]:
+        link = entry["link"] if isinstance(entry, dict) else str(entry)
+        created_at = entry.get("created_at") if isinstance(entry, dict) else None
         try:
             order_resp = session.get(link, timeout=30)
             order_resp.raise_for_status()
-            number, added, state = parse_html_and_insert(conn, order_resp.text)
+            number, added, state = parse_html_and_insert(conn, order_resp.text, forced_order_date=created_at)
             if state == "exists":
                 existing_orders += 1
+            elif state == "updated":
+                updated_orders += 1
             else:
                 created_orders += 1
                 total_parts += added
@@ -187,9 +221,10 @@ def _import_order_links_into_db(conn: sqlite3.Connection, session: requests.Sess
             errors.append(f"{link} -> {exc}")
 
     return {
-        "total_links": len(order_links),
+        "total_links": len(order_entries),
         "imported": created_orders,
         "existing": existing_orders,
+        "updated": updated_orders,
         "parts": total_parts,
         "errors": errors,
     }
@@ -203,8 +238,8 @@ def import_orders_from_account(
     limit: int = 20,
 ):
     session, _ = login_and_fetch_orders_html(username, password, orders_url)
-    order_links = _collect_order_links_from_pages(session, orders_url, limit=limit, max_pages=120)
-    return _import_order_links_into_db(conn, session, order_links, limit)
+    order_entries = _collect_order_links_from_pages(session, orders_url, limit=limit, max_pages=120)
+    return _import_order_links_into_db(conn, session, order_entries, limit)
 
 
 def import_orders_from_cookie(
@@ -214,8 +249,8 @@ def import_orders_from_cookie(
     limit: int = 20,
 ):
     session, _ = fetch_orders_html_with_cookie(orders_url, cookie_header)
-    order_links = _collect_order_links_from_pages(session, orders_url, limit=limit, max_pages=120)
-    return _import_order_links_into_db(conn, session, order_links, limit)
+    order_entries = _collect_order_links_from_pages(session, orders_url, limit=limit, max_pages=120)
+    return _import_order_links_into_db(conn, session, order_entries, limit)
 
 
 def _normalize_order_page_url(base_orders_url: str, page: int):
@@ -227,7 +262,7 @@ def _normalize_order_page_url(base_orders_url: str, page: int):
 
 
 def _collect_order_links_from_pages(session: requests.Session, orders_url: str, limit: int, max_pages: int = 50):
-    all_links = []
+    all_entries = []
     seen = set()
 
     pages_to_scan = max(1, min(max_pages, (limit // 20) + 2))
@@ -235,24 +270,25 @@ def _collect_order_links_from_pages(session: requests.Session, orders_url: str, 
         page_url = _normalize_order_page_url(orders_url, page)
         resp = session.get(page_url, timeout=30)
         resp.raise_for_status()
-        page_links = extract_order_links(resp.text)
+        page_entries = extract_order_entries(resp.text)
 
-        if not page_links and page > 0:
+        if not page_entries and page > 0:
             break
 
         added_this_page = 0
-        for link in page_links:
+        for entry in page_entries:
+            link = entry["link"]
             if link not in seen:
                 seen.add(link)
-                all_links.append(link)
+                all_entries.append(entry)
                 added_this_page += 1
-                if len(all_links) >= limit:
-                    return all_links
+                if len(all_entries) >= limit:
+                    return all_entries
 
         if page > 0 and added_this_page == 0:
             break
 
-    return all_links
+    return all_entries
 
 
 def _extract_availability(text: str):
@@ -334,7 +370,7 @@ def _extract_order_placed_date(soup: BeautifulSoup):
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def parse_html_and_insert(conn: sqlite3.Connection, html_text: str):
+def parse_html_and_insert(conn: sqlite3.Connection, html_text: str, forced_order_date=None):
     cursor = conn.cursor()
     soup = BeautifulSoup(html_text, "html.parser")
 
@@ -344,11 +380,16 @@ def parse_html_and_insert(conn: sqlite3.Connection, html_text: str):
 
     order_number = order_title.text.strip().replace("Order ", "")
 
-    cursor.execute("SELECT id FROM comenzi WHERE order_number = ?", (order_number,))
-    if cursor.fetchone():
+    cursor.execute("SELECT id, data_plasare FROM comenzi WHERE order_number = ?", (order_number,))
+    existing = cursor.fetchone()
+    if existing:
+        if forced_order_date and existing["data_plasare"] != forced_order_date:
+            cursor.execute("UPDATE comenzi SET data_plasare = ? WHERE order_number = ?", (forced_order_date, order_number))
+            conn.commit()
+            return order_number, 0, "updated"
         return order_number, 0, "exists"
 
-    data = _extract_order_placed_date(soup)
+    data = forced_order_date or _extract_order_placed_date(soup)
     cursor.execute(
         "INSERT INTO comenzi (order_number, data_plasare, tip) VALUES (?, ?, 'plasata')",
         (order_number, data),
@@ -703,7 +744,7 @@ def main():
                     )
 
                 st.success(
-                    f"Import gata. Noi: {result['imported']} | Existente: {result['existing']} | "
+                    f"Import gata. Noi: {result['imported']} | Actualizate: {result.get('updated', 0)} | Existente: {result['existing']} | "
                     f"Piese noi: {result['parts']} | Linkuri detectate: {result['total_links']}"
                 )
                 if result["errors"]:
