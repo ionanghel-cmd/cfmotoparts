@@ -41,3 +41,6 @@ Dacă publici doar acolo (ex: `ionanghel-cmd.github.io/cfmotoparts`), upload-ul 
 - Rezolvarea automată CAPTCHA **nu este suportată**.
 - Importul poate scana automat paginile următoare de orders (`?page=1`, `?page=2`, etc.) și permite import masiv până la 1000 comenzi din UI.
 - Există tab nou `Căutare cod piesă` care caută codul în toate comenzile și arată: nr comandă, data comenzii, preț unitar, disponibilitate la plasare (`sufficient stock` / `not in stock; delivery ...`) și unitățile comandate.
+- Data comenzii este preluată din pagina fiecărei comenzi (ex. `Invoice date`), nu data importului.
+- În detalii comandă se afișează și `Preț unitar` + `Disponibilitate la plasare`.
+- Poți căuta comenzile după ID-ul de comandă CFMoto (ex. `2026-543`) direct în tab-urile de comenzi.

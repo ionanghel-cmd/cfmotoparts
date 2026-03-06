@@ -288,6 +288,52 @@ def _extract_price_from_text(text: str):
         return None
 
 
+def _parse_cfmoto_datetime(raw: str):
+    raw = " ".join(raw.replace(" ", " ").split())
+    patterns = [
+        "%A, %B %d, %Y - %H:%M",   # Thursday, March 5, 2026 - 12:20
+        "%a, %m/%d/%Y - %H:%M",    # Thu, 03/05/2026 - 12:20
+    ]
+    for fmt in patterns:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_order_placed_date(soup: BeautifulSoup):
+    # 1) try explicit Invoice date label context
+    invoice_label = soup.find(string=re.compile(r"invoice\s*date", re.I))
+    if invoice_label:
+        candidates = []
+        node = invoice_label.parent
+        if node:
+            candidates.append(node.get_text(" ", strip=True))
+            if node.next_sibling and hasattr(node.next_sibling, "get_text"):
+                candidates.append(node.next_sibling.get_text(" ", strip=True))
+        for c in candidates:
+            c = re.sub(r"(?i)invoice\s*date\s*:?", "", c).strip()
+            dt = _parse_cfmoto_datetime(c)
+            if dt:
+                return dt.strftime("%Y-%m-%d %H:%M")
+
+    # 2) fallback from full page text
+    page_text = soup.get_text("\n", strip=True)
+    patterns = [
+        r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}\s*-\s*\d{1,2}:\d{2}",
+        r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun),\s*\d{2}/\d{2}/\d{4}\s*-\s*\d{1,2}:\d{2}",
+    ]
+    for pat in patterns:
+        match = re.search(pat, page_text)
+        if match:
+            dt = _parse_cfmoto_datetime(match.group(0))
+            if dt:
+                return dt.strftime("%Y-%m-%d %H:%M")
+
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 def parse_html_and_insert(conn: sqlite3.Connection, html_text: str):
     cursor = conn.cursor()
     soup = BeautifulSoup(html_text, "html.parser")
@@ -302,7 +348,7 @@ def parse_html_and_insert(conn: sqlite3.Connection, html_text: str):
     if cursor.fetchone():
         return order_number, 0, "exists"
 
-    data = datetime.now().strftime("%Y-%m-%d")
+    data = _extract_order_placed_date(soup)
     cursor.execute(
         "INSERT INTO comenzi (order_number, data_plasare, tip) VALUES (?, ?, 'plasata')",
         (order_number, data),
@@ -452,11 +498,35 @@ def get_comenzi(conn: sqlite3.Connection, tip: str):
     return cursor.fetchall()
 
 
+def get_comenzi_by_order_number(conn: sqlite3.Connection, tip: str, order_query: str):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT c.id, c.order_number, c.data_plasare,
+               COALESCE(SUM(p.cantitate - p.cantitate_primita), 0) AS lipsa
+        FROM comenzi c LEFT JOIN piese p ON c.id = p.comanda_id
+        WHERE c.tip = ? AND c.order_number LIKE ?
+        GROUP BY c.id
+        ORDER BY c.data_plasare DESC
+        """,
+        (tip, f"%{order_query.strip()}%"),
+    )
+    return cursor.fetchall()
+
+
+def get_comanda_id_by_order_number(conn: sqlite3.Connection, order_number: str):
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM comenzi WHERE order_number = ?", (order_number.strip(),))
+    row = cursor.fetchone()
+    return row["id"] if row else None
+
+
 def get_piese_for_comanda(conn: sqlite3.Connection, comanda_id: int, query_text: str = ""):
     cursor = conn.cursor()
     query = """
         SELECT id, cod, nume_piesa, cantitate, cantitate_primita,
-               (cantitate - cantitate_primita) AS lipsa, status, data_primire
+               (cantitate - cantitate_primita) AS lipsa, status, data_primire,
+               pret_unitar, disponibilitate_plasare
         FROM piese
         WHERE comanda_id = ?
     """
@@ -520,6 +590,7 @@ def format_piese_rows(rows):
         comandate = float(row_get(row, "cantitate", 3, 0))
         venite = float(row_get(row, "cantitate_primita", 4, 0))
         asteptate = float(row_get(row, "lipsa", 5, comandate - venite))
+        pret = row_get(row, "pret_unitar", 8, None)
         data.append(
             {
                 "Cod piesă": str(row_get(row, "cod", 1, "")),
@@ -527,6 +598,8 @@ def format_piese_rows(rows):
                 "Comandate": comandate,
                 "Așteptate": asteptate,
                 "Venite": venite,
+                "Preț unitar": pret,
+                "Disponibilitate la plasare": row_get(row, "disponibilitate_plasare", 9, "") or "-",
             }
         )
     return data
@@ -643,7 +716,8 @@ def main():
     tab1, tab2, tab3, tab4 = st.tabs(["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Raport așteptate", "Căutare cod piesă"])
 
     with tab1:
-        rows = get_comenzi(conn, "plasata")
+        order_q1 = st.text_input("Caută după ID comandă CFMoto (ex: 2026-543)", key="order_q_plasata")
+        rows = get_comenzi_by_order_number(conn, "plasata", order_q1) if order_q1.strip() else get_comenzi(conn, "plasata")
         st.dataframe(
             [
                 {
@@ -657,14 +731,23 @@ def main():
             use_container_width=True,
         )
 
-        selected_id = st.number_input("Vezi detalii comandă (ID)", min_value=0, step=1, value=0, key="det_plasata")
+        selected_order_no = st.text_input("Vezi detalii după ID comandă CFMoto", key="det_order_plasata")
+        selected_id = 0
+        if selected_order_no.strip():
+            selected_id = get_comanda_id_by_order_number(conn, selected_order_no) or 0
+            if selected_id == 0:
+                st.warning("Nu am găsit comanda cu acest ID CFMoto.")
+
+        selected_id_num = st.number_input("Sau vezi detalii comandă (ID local)", min_value=0, step=1, value=0, key="det_plasata")
+        selected_id = selected_id or int(selected_id_num)
         if selected_id > 0:
             query_text = st.text_input("Caută piesă (cod / denumire)", key="q_plasata")
             detalii = get_piese_for_comanda(conn, selected_id, query_text)
             st.dataframe(format_piese_rows(detalii), use_container_width=True)
 
     with tab2:
-        rows = get_comenzi(conn, "viitoare")
+        order_q2 = st.text_input("Caută după ID comandă/factură CFMoto", key="order_q_viitoare")
+        rows = get_comenzi_by_order_number(conn, "viitoare", order_q2) if order_q2.strip() else get_comenzi(conn, "viitoare")
         st.dataframe(
             [
                 {
@@ -678,7 +761,15 @@ def main():
             use_container_width=True,
         )
 
-        selected_id = st.number_input("Vezi detalii factură (ID)", min_value=0, step=1, value=0, key="det_viitoare")
+        selected_order_no = st.text_input("Vezi detalii după ID comandă/factură CFMoto", key="det_order_viitoare")
+        selected_id = 0
+        if selected_order_no.strip():
+            selected_id = get_comanda_id_by_order_number(conn, selected_order_no) or 0
+            if selected_id == 0:
+                st.warning("Nu am găsit comanda/factura cu acest ID CFMoto.")
+
+        selected_id_num = st.number_input("Sau vezi detalii factură (ID local)", min_value=0, step=1, value=0, key="det_viitoare")
+        selected_id = selected_id or int(selected_id_num)
         if selected_id > 0:
             query_text = st.text_input("Caută piesă (cod / denumire)", key="q_viitoare")
             detalii = get_piese_for_comanda(conn, selected_id, query_text)
