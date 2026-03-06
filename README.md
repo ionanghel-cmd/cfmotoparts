@@ -44,3 +44,4 @@ Dacă publici doar acolo (ex: `ionanghel-cmd.github.io/cfmotoparts`), upload-ul 
 - Data comenzii este preluată din pagina fiecărei comenzi (ex. `Invoice date`), nu data importului.
 - În detalii comandă se afișează și `Preț unitar` + `Disponibilitate la plasare`.
 - Poți căuta comenzile după ID-ul de comandă CFMoto (ex. `2026-543`) direct în tab-urile de comenzi.
+- În detalii comandă poți marca piese ca primite manual sau prin scanare barcode (ex: `5BYV-041033-1000*1`). Suffix-ul `*1/*2/...` este tratat ca număr de bucăți, iar codul folosit la căutare este doar codul piesei.
