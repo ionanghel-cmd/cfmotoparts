@@ -34,6 +34,8 @@ Dacă publici doar acolo (ex: `ionanghel-cmd.github.io/cfmotoparts`), upload-ul 
 
 
 ## Sincronizare directă din contul cfmotoparts.eu
-- În aplicație completezi user + parolă și URL-ul de listă comenzi (implicit: `https://cfmotoparts.eu/user/201/orders?order=created&sort=desc`).
-- Apasă `Login și import comenzi`: aplicația intră în cont, citește comenzile și importă automat comenzile în baza locală (`comenzi.db`).
-- Dacă site-ul activează verificări suplimentare (ex. CAPTCHA), login-ul automat poate eșua și trebuie făcut import manual din HTML.
+- Fluxul de sincronizare merge astfel: login la `https://cfmotoparts.eu/user/login` → acces listă comenzi (`https://cfmotoparts.eu/user/201/orders?order=created&sort=desc`) → acces fiecare link din **Order number** și import piese.
+- În aplicație ai două moduri:
+  1. `Login direct (fără CAPTCHA)` – pentru conturi/sesiuni unde loginul nu cere CAPTCHA.
+  2. `Cookie de sesiune (compatibil CAPTCHA)` – faci login manual în browser, apoi copiezi `Cookie` header în aplicație pentru import.
+- Rezolvarea automată CAPTCHA **nu este suportată**.

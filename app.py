@@ -66,7 +66,12 @@ def _extract_csrf_login_fields(html_text: str):
     return payload
 
 
-def login_and_fetch_orders_html(username: str, password: str, orders_url: str = ORDERS_URL):
+def _page_has_captcha(html_text: str) -> bool:
+    txt = html_text.lower()
+    return "captcha" in txt or "g-recaptcha" in txt or "i'm not a robot" in txt
+
+
+def _build_session(cookie_header: str = ""):
     session = requests.Session()
     session.headers.update(
         {
@@ -74,10 +79,23 @@ def login_and_fetch_orders_html(username: str, password: str, orders_url: str = 
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         }
     )
+    if cookie_header.strip():
+        session.headers.update({"Cookie": cookie_header.strip()})
+    return session
+
+
+def login_and_fetch_orders_html(username: str, password: str, orders_url: str = ORDERS_URL):
+    session = _build_session()
 
     login_url = f"{BASE_URL}/user/login"
     login_page = session.get(login_url, timeout=30)
     login_page.raise_for_status()
+
+    if _page_has_captcha(login_page.text):
+        raise ValueError(
+            "Pagina de login cere CAPTCHA. Nu pot automatiza rezolvarea CAPTCHA. "
+            "Folosește metoda cu cookie de sesiune sau import HTML după login manual."
+        )
 
     payload = _extract_csrf_login_fields(login_page.text)
     payload["name"] = username
@@ -91,22 +109,42 @@ def login_and_fetch_orders_html(username: str, password: str, orders_url: str = 
 
     if "/user/login" in orders_response.url or "edit-name" in orders_response.text:
         raise ValueError(
-            "Autentificarea a eșuat. Verifică user/parolă sau dacă site-ul cere CAPTCHA suplimentar."
+            "Autentificarea a eșuat. Verifică user/parolă sau folosește metoda cu cookie dacă login-ul are CAPTCHA."
         )
 
     return session, orders_response.text
+
+
+def fetch_orders_html_with_cookie(orders_url: str, cookie_header: str):
+    if not cookie_header.strip():
+        raise ValueError("Cookie-ul de sesiune este gol.")
+
+    session = _build_session(cookie_header)
+    response = session.get(orders_url, timeout=30)
+    response.raise_for_status()
+
+    if "/user/login" in response.url or "Log in" in response.text[:2000]:
+        raise ValueError("Cookie invalid/expirat. Copiază din nou cookie-ul de sesiune după login manual.")
+
+    return session, response.text
 
 
 def extract_order_links(orders_html: str):
     soup = BeautifulSoup(orders_html, "html.parser")
     links = []
 
+    order_patterns = [
+        r"/user/\d+/orders/\d+",
+        r"/orders/\d+",
+        r"/order/\d+",
+    ]
+
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        if re.search(r"/order/\d+", href):
+        text = a.get_text(" ", strip=True)
+        if any(re.search(pattern, href) for pattern in order_patterns) or re.match(r"^\d{4}-\d+", text):
             links.append(urljoin(BASE_URL, href))
 
-    # dedup preserving order
     seen = set()
     deduped = []
     for link in links:
@@ -116,16 +154,7 @@ def extract_order_links(orders_html: str):
     return deduped
 
 
-def import_orders_from_account(
-    conn: sqlite3.Connection,
-    username: str,
-    password: str,
-    orders_url: str = ORDERS_URL,
-    limit: int = 20,
-):
-    session, orders_html = login_and_fetch_orders_html(username, password, orders_url)
-    order_links = extract_order_links(orders_html)
-
+def _import_order_links_into_db(conn: sqlite3.Connection, session: requests.Session, order_links, limit: int):
     if not order_links:
         raise ValueError("Nu am găsit linkuri de comenzi în pagina de orders.")
 
@@ -154,6 +183,29 @@ def import_orders_from_account(
         "parts": total_parts,
         "errors": errors,
     }
+
+
+def import_orders_from_account(
+    conn: sqlite3.Connection,
+    username: str,
+    password: str,
+    orders_url: str = ORDERS_URL,
+    limit: int = 20,
+):
+    session, orders_html = login_and_fetch_orders_html(username, password, orders_url)
+    order_links = extract_order_links(orders_html)
+    return _import_order_links_into_db(conn, session, order_links, limit)
+
+
+def import_orders_from_cookie(
+    conn: sqlite3.Connection,
+    cookie_header: str,
+    orders_url: str = ORDERS_URL,
+    limit: int = 20,
+):
+    session, orders_html = fetch_orders_html_with_cookie(orders_url, cookie_header)
+    order_links = extract_order_links(orders_html)
+    return _import_order_links_into_db(conn, session, order_links, limit)
 
 
 def parse_html_and_insert(conn: sqlite3.Connection, html_text: str):
@@ -425,20 +477,43 @@ def main():
                 except Exception as exc:
                     st.error(f"Eroare la import PDF: {exc}")
 
-    st.subheader("Sincronizare directă din contul cfmotoparts.eu")
+    st.subheader("Sincronizare comenzi din cfmotoparts.eu")
+    st.info(
+        "Se face login la https://cfmotoparts.eu/user/login, apoi se citește lista din orders și fiecare link din Order number. "
+        "Dacă apare CAPTCHA, folosește metoda cu cookie de sesiune (login manual în browser)."
+    )
+
+    sync_mode = st.radio(
+        "Metodă sincronizare",
+        ["Login direct (fără CAPTCHA)", "Cookie de sesiune (compatibil CAPTCHA)"],
+        horizontal=True,
+    )
+
     with st.form("cfmoto_sync_form"):
-        sync_user = st.text_input("User / Email cfmotoparts.eu")
-        sync_pass = st.text_input("Parolă", type="password")
         sync_orders_url = st.text_input("URL listă comenzi", value=ORDERS_URL)
         sync_limit = st.number_input("Număr maxim comenzi de importat", min_value=1, max_value=200, value=25, step=1)
-        sync_submit = st.form_submit_button("Login și import comenzi")
+
+        if sync_mode == "Login direct (fără CAPTCHA)":
+            sync_user = st.text_input("User / Email cfmotoparts.eu")
+            sync_pass = st.text_input("Parolă", type="password")
+            sync_cookie = ""
+        else:
+            sync_user = ""
+            sync_pass = ""
+            sync_cookie = st.text_area(
+                "Cookie header din browser",
+                placeholder="Ex: SESSxxxx=...; has_js=1; ...",
+                height=110,
+            )
+
+        sync_submit = st.form_submit_button("Import comenzi")
 
     if sync_submit:
-        if not sync_user or not sync_pass:
-            st.warning("Completează user și parolă.")
-        else:
-            with st.spinner("Mă loghez pe cfmotoparts.eu și import comenzile..."):
-                try:
+        with st.spinner("Import în curs..."):
+            try:
+                if sync_mode == "Login direct (fără CAPTCHA)":
+                    if not sync_user or not sync_pass:
+                        raise ValueError("Completează user și parolă.")
                     result = import_orders_from_account(
                         conn,
                         sync_user,
@@ -446,16 +521,24 @@ def main():
                         orders_url=sync_orders_url.strip() or ORDERS_URL,
                         limit=int(sync_limit),
                     )
-                    st.success(
-                        f"Import gata. Noi: {result['imported']} | Existente: {result['existing']} | "
-                        f"Piese noi: {result['parts']} | Linkuri detectate: {result['total_links']}"
+                else:
+                    result = import_orders_from_cookie(
+                        conn,
+                        sync_cookie,
+                        orders_url=sync_orders_url.strip() or ORDERS_URL,
+                        limit=int(sync_limit),
                     )
-                    if result["errors"]:
-                        st.warning("Unele comenzi nu au putut fi importate:")
-                        for err in result["errors"][:10]:
-                            st.write(f"- {err}")
-                except Exception as exc:
-                    st.error(f"Eroare la login/sincronizare: {exc}")
+
+                st.success(
+                    f"Import gata. Noi: {result['imported']} | Existente: {result['existing']} | "
+                    f"Piese noi: {result['parts']} | Linkuri detectate: {result['total_links']}"
+                )
+                if result["errors"]:
+                    st.warning("Unele comenzi nu au putut fi importate:")
+                    for err in result["errors"][:10]:
+                        st.write(f"- {err}")
+            except Exception as exc:
+                st.error(f"Eroare la sincronizare: {exc}")
 
     tab1, tab2, tab3 = st.tabs(["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Raport așteptate"])
 
@@ -518,8 +601,8 @@ def main():
             st.markdown("\n".join(lines))
 
     st.caption(
-        "Poți importa automat comenzile direct din contul tău cfmotoparts.eu (login + sync). "
-        "Dacă site-ul activează CAPTCHA, sincronizarea automată poate necesita import manual HTML pentru acea sesiune."
+        "Pentru conturi cu CAPTCHA, aplicația nu rezolvă CAPTCHA automat. "
+        "Fă login manual în browser și folosește importul cu cookie de sesiune."
     )
 
     conn.close()
