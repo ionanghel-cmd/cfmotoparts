@@ -31,3 +31,9 @@ streamlit run app.py
 Dacă publici doar acolo (ex: `ionanghel-cmd.github.io/cfmotoparts`), upload-ul nu va funcționa pentru această aplicație.
 
 > Notă: baza de date SQLite e locală instanței de deploy. Pentru persistență reală multi-user recomand Postgres/Supabase.
+
+
+## Sincronizare directă din contul cfmotoparts.eu
+- În aplicație completezi user + parolă și URL-ul de listă comenzi (implicit: `https://cfmotoparts.eu/user/201/orders?order=created&sort=desc`).
+- Apasă `Login și import comenzi`: aplicația intră în cont, citește comenzile și importă automat comenzile în baza locală (`comenzi.db`).
+- Dacă site-ul activează verificări suplimentare (ex. CAPTCHA), login-ul automat poate eșua și trebuie făcut import manual din HTML.

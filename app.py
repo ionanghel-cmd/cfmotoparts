@@ -2,14 +2,16 @@ import io
 import re
 import sqlite3
 from datetime import datetime
-
-import pandas as pd
+from urllib.parse import urljoin
 
 import pdfplumber
+import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
 DB_PATH = "comenzi.db"
+BASE_URL = "https://cfmotoparts.eu"
+ORDERS_URL = f"{BASE_URL}/user/201/orders?order=created&sort=desc"
 
 
 def get_connection() -> sqlite3.Connection:
@@ -48,6 +50,110 @@ def init_db(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
+
+
+def _extract_csrf_login_fields(html_text: str):
+    soup = BeautifulSoup(html_text, "html.parser")
+    form = soup.find("form", id="user-login") or soup.find("form", attrs={"action": "/user/login"})
+    if not form:
+        raise ValueError("Nu am găsit formularul de login pe cfmotoparts.eu")
+
+    payload = {}
+    for inp in form.find_all("input"):
+        name = (inp.get("name") or "").strip()
+        if name:
+            payload[name] = inp.get("value") or ""
+    return payload
+
+
+def login_and_fetch_orders_html(username: str, password: str, orders_url: str = ORDERS_URL):
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        }
+    )
+
+    login_url = f"{BASE_URL}/user/login"
+    login_page = session.get(login_url, timeout=30)
+    login_page.raise_for_status()
+
+    payload = _extract_csrf_login_fields(login_page.text)
+    payload["name"] = username
+    payload["pass"] = password
+
+    response = session.post(login_url, data=payload, timeout=30, allow_redirects=True)
+    response.raise_for_status()
+
+    orders_response = session.get(orders_url, timeout=30)
+    orders_response.raise_for_status()
+
+    if "/user/login" in orders_response.url or "edit-name" in orders_response.text:
+        raise ValueError(
+            "Autentificarea a eșuat. Verifică user/parolă sau dacă site-ul cere CAPTCHA suplimentar."
+        )
+
+    return session, orders_response.text
+
+
+def extract_order_links(orders_html: str):
+    soup = BeautifulSoup(orders_html, "html.parser")
+    links = []
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if re.search(r"/order/\d+", href):
+            links.append(urljoin(BASE_URL, href))
+
+    # dedup preserving order
+    seen = set()
+    deduped = []
+    for link in links:
+        if link not in seen:
+            deduped.append(link)
+            seen.add(link)
+    return deduped
+
+
+def import_orders_from_account(
+    conn: sqlite3.Connection,
+    username: str,
+    password: str,
+    orders_url: str = ORDERS_URL,
+    limit: int = 20,
+):
+    session, orders_html = login_and_fetch_orders_html(username, password, orders_url)
+    order_links = extract_order_links(orders_html)
+
+    if not order_links:
+        raise ValueError("Nu am găsit linkuri de comenzi în pagina de orders.")
+
+    created_orders = 0
+    existing_orders = 0
+    total_parts = 0
+    errors = []
+
+    for link in order_links[:limit]:
+        try:
+            order_resp = session.get(link, timeout=30)
+            order_resp.raise_for_status()
+            number, added, state = parse_html_and_insert(conn, order_resp.text)
+            if state == "exists":
+                existing_orders += 1
+            else:
+                created_orders += 1
+                total_parts += added
+        except Exception as exc:
+            errors.append(f"{link} -> {exc}")
+
+    return {
+        "total_links": len(order_links),
+        "imported": created_orders,
+        "existing": existing_orders,
+        "parts": total_parts,
+        "errors": errors,
+    }
 
 
 def parse_html_and_insert(conn: sqlite3.Connection, html_text: str):
@@ -319,6 +425,38 @@ def main():
                 except Exception as exc:
                     st.error(f"Eroare la import PDF: {exc}")
 
+    st.subheader("Sincronizare directă din contul cfmotoparts.eu")
+    with st.form("cfmoto_sync_form"):
+        sync_user = st.text_input("User / Email cfmotoparts.eu")
+        sync_pass = st.text_input("Parolă", type="password")
+        sync_orders_url = st.text_input("URL listă comenzi", value=ORDERS_URL)
+        sync_limit = st.number_input("Număr maxim comenzi de importat", min_value=1, max_value=200, value=25, step=1)
+        sync_submit = st.form_submit_button("Login și import comenzi")
+
+    if sync_submit:
+        if not sync_user or not sync_pass:
+            st.warning("Completează user și parolă.")
+        else:
+            with st.spinner("Mă loghez pe cfmotoparts.eu și import comenzile..."):
+                try:
+                    result = import_orders_from_account(
+                        conn,
+                        sync_user,
+                        sync_pass,
+                        orders_url=sync_orders_url.strip() or ORDERS_URL,
+                        limit=int(sync_limit),
+                    )
+                    st.success(
+                        f"Import gata. Noi: {result['imported']} | Existente: {result['existing']} | "
+                        f"Piese noi: {result['parts']} | Linkuri detectate: {result['total_links']}"
+                    )
+                    if result["errors"]:
+                        st.warning("Unele comenzi nu au putut fi importate:")
+                        for err in result["errors"][:10]:
+                            st.write(f"- {err}")
+                except Exception as exc:
+                    st.error(f"Eroare la login/sincronizare: {exc}")
+
     tab1, tab2, tab3 = st.tabs(["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Raport așteptate"])
 
     with tab1:
@@ -380,8 +518,8 @@ def main():
             st.markdown("\n".join(lines))
 
     st.caption(
-        "Dacă ai publicat pe GitHub Pages (ionanghel-cmd.github.io), aplicația Python nu poate rula acolo. "
-        "Folosește Streamlit Community Cloud pentru runtime Python."
+        "Poți importa automat comenzile direct din contul tău cfmotoparts.eu (login + sync). "
+        "Dacă site-ul activează CAPTCHA, sincronizarea automată poate necesita import manual HTML pentru acea sesiune."
     )
 
     conn.close()
