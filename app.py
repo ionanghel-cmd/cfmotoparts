@@ -1,31 +1,39 @@
 import io
 import re
-import sqlite3
 from datetime import datetime
+from typing import Optional
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import pdfplumber
+import psycopg2
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
+from psycopg2.extras import RealDictCursor
 
-DB_PATH = "comenzi.db"
 BASE_URL = "https://cfmotoparts.eu"
 ORDERS_URL = f"{BASE_URL}/user/201/orders?order=created&sort=desc"
 
 
-def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_connection():
+    return psycopg2.connect(
+        host=st.secrets["SUPABASE_DB_HOST"],
+        dbname=st.secrets["SUPABASE_DB_NAME"],
+        user=st.secrets["SUPABASE_DB_USER"],
+        password=st.secrets["SUPABASE_DB_PASSWORD"],
+        port=st.secrets["SUPABASE_DB_PORT"],
+        sslmode="require",
+        cursor_factory=RealDictCursor,
+    )
 
 
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn) -> None:
     cursor = conn.cursor()
+
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS comenzi (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id BIGSERIAL PRIMARY KEY,
             order_number TEXT UNIQUE,
             data_plasare TEXT NOT NULL,
             note TEXT,
@@ -37,34 +45,44 @@ def init_db(conn: sqlite3.Connection) -> None:
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS piese (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            comanda_id INTEGER NOT NULL,
+            id BIGSERIAL PRIMARY KEY,
+            comanda_id BIGINT NOT NULL REFERENCES comenzi(id) ON DELETE CASCADE,
             nume_piesa TEXT NOT NULL,
             cod TEXT,
-            cantitate REAL NOT NULL,
-            cantitate_primita REAL DEFAULT 0.0,
+            cantitate DOUBLE PRECISION NOT NULL,
+            cantitate_primita DOUBLE PRECISION DEFAULT 0.0,
             data_primire TEXT,
             status TEXT DEFAULT 'asteptata',
-            pret_unitar REAL,
-            disponibilitate_plasare TEXT,
-            FOREIGN KEY (comanda_id) REFERENCES comenzi(id)
+            pret_unitar DOUBLE PRECISION,
+            disponibilitate_plasare TEXT
         )
         """
     )
 
-    cursor.execute("PRAGMA table_info(piese)")
-    cols = {row[1] for row in cursor.fetchall()}
-    if "pret_unitar" not in cols:
-        cursor.execute("ALTER TABLE piese ADD COLUMN pret_unitar REAL")
-    if "disponibilitate_plasare" not in cols:
-        cursor.execute("ALTER TABLE piese ADD COLUMN disponibilitate_plasare TEXT")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_comenzi_order_number ON comenzi(order_number)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_comenzi_tip ON comenzi(tip)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_piese_comanda_id ON piese(comanda_id)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_piese_cod ON piese(cod)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_piese_status ON piese(status)"
+    )
 
     conn.commit()
 
 
 def _extract_csrf_login_fields(html_text: str):
     soup = BeautifulSoup(html_text, "html.parser")
-    form = soup.find("form", id="user-login") or soup.find("form", attrs={"action": "/user/login"})
+    form = soup.find("form", id="user-login") or soup.find(
+        "form", attrs={"action": "/user/login"}
+    )
     if not form:
         raise ValueError("Nu am găsit formularul de login pe cfmotoparts.eu")
 
@@ -85,8 +103,10 @@ def _build_session(cookie_header: str = ""):
     session = requests.Session()
     session.headers.update(
         {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
         }
     )
     if cookie_header.strip():
@@ -94,7 +114,11 @@ def _build_session(cookie_header: str = ""):
     return session
 
 
-def login_and_fetch_orders_html(username: str, password: str, orders_url: str = ORDERS_URL):
+def login_and_fetch_orders_html(
+    username: str,
+    password: str,
+    orders_url: str = ORDERS_URL,
+):
     session = _build_session()
 
     login_url = f"{BASE_URL}/user/login"
@@ -146,9 +170,9 @@ def _extract_created_date_from_row_text(text: str):
         r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}\s*-\s*\d{1,2}:\d{2}",
     ]
     for pat in patterns:
-        m = re.search(pat, text)
-        if m:
-            dt = _parse_cfmoto_datetime(m.group(0))
+        match = re.search(pat, text)
+        if match:
+            dt = _parse_cfmoto_datetime(match.group(0))
             if dt:
                 return dt.strftime("%Y-%m-%d %H:%M")
     return None
@@ -182,10 +206,10 @@ def extract_order_entries(orders_html: str):
 
     seen = set()
     deduped = []
-    for e in entries:
-        if e["link"] not in seen:
-            deduped.append(e)
-            seen.add(e["link"])
+    for entry in entries:
+        if entry["link"] not in seen:
+            deduped.append(entry)
+            seen.add(entry["link"])
     return deduped
 
 
@@ -193,7 +217,7 @@ def extract_order_links(orders_html: str):
     return [e["link"] for e in extract_order_entries(orders_html)]
 
 
-def _import_order_links_into_db(conn: sqlite3.Connection, session: requests.Session, order_entries, limit: int):
+def _import_order_links_into_db(conn, session: requests.Session, order_entries, limit: int):
     if not order_entries:
         raise ValueError("Nu am găsit linkuri de comenzi în pagina de orders.")
 
@@ -209,7 +233,9 @@ def _import_order_links_into_db(conn: sqlite3.Connection, session: requests.Sess
         try:
             order_resp = session.get(link, timeout=30)
             order_resp.raise_for_status()
-            number, added, state = parse_html_and_insert(conn, order_resp.text, forced_order_date=created_at)
+            number, added, state = parse_html_and_insert(
+                conn, order_resp.text, forced_order_date=created_at
+            )
             if state == "exists":
                 existing_orders += 1
             elif state == "updated":
@@ -231,7 +257,7 @@ def _import_order_links_into_db(conn: sqlite3.Connection, session: requests.Sess
 
 
 def import_orders_from_account(
-    conn: sqlite3.Connection,
+    conn,
     username: str,
     password: str,
     orders_url: str = ORDERS_URL,
@@ -243,7 +269,7 @@ def import_orders_from_account(
 
 
 def import_orders_from_cookie(
-    conn: sqlite3.Connection,
+    conn,
     cookie_header: str,
     orders_url: str = ORDERS_URL,
     limit: int = 20,
@@ -294,23 +320,22 @@ def _collect_order_links_from_pages(session: requests.Session, orders_url: str, 
 def _extract_availability(text: str):
     lowered = text.lower()
     if "not in stock" in lowered:
-        m = re.search(r"not in stock[^\n]*", text, flags=re.I)
-        return m.group(0).strip() if m else "not in stock"
+        match = re.search(r"not in stock[^\n]*", text, flags=re.I)
+        return match.group(0).strip() if match else "not in stock"
     if "sufficient stock" in lowered:
         return "sufficient stock"
     return ""
 
 
 def _extract_price_from_text(text: str):
-    m = re.search(r"(\d+[\d.,]*)\s*€", text)
-    if not m:
-        m = re.search(r"€\s*(\d+[\d.,]*)", text)
-    if not m:
+    match = re.search(r"(\d+[\d.,]*)\s*€", text)
+    if not match:
+        match = re.search(r"€\s*(\d+[\d.,]*)", text)
+    if not match:
         return None
 
-    raw = m.group(1).replace(" ", "")
+    raw = match.group(1).replace(" ", "")
     if "," in raw and "." in raw:
-        # keep the last separator as decimal marker
         if raw.rfind(",") > raw.rfind("."):
             raw = raw.replace(".", "").replace(",", ".")
         else:
@@ -325,10 +350,10 @@ def _extract_price_from_text(text: str):
 
 
 def _parse_cfmoto_datetime(raw: str):
-    raw = " ".join(raw.replace(" ", " ").split())
+    raw = " ".join(raw.replace(" ", " ").split())
     patterns = [
-        "%A, %B %d, %Y - %H:%M",   # Thursday, March 5, 2026 - 12:20
-        "%a, %m/%d/%Y - %H:%M",    # Thu, 03/05/2026 - 12:20
+        "%A, %B %d, %Y - %H:%M",
+        "%a, %m/%d/%Y - %H:%M",
     ]
     for fmt in patterns:
         try:
@@ -339,7 +364,6 @@ def _parse_cfmoto_datetime(raw: str):
 
 
 def _extract_order_placed_date(soup: BeautifulSoup):
-    # 1) try explicit Invoice date label context
     invoice_label = soup.find(string=re.compile(r"invoice\s*date", re.I))
     if invoice_label:
         candidates = []
@@ -348,13 +372,12 @@ def _extract_order_placed_date(soup: BeautifulSoup):
             candidates.append(node.get_text(" ", strip=True))
             if node.next_sibling and hasattr(node.next_sibling, "get_text"):
                 candidates.append(node.next_sibling.get_text(" ", strip=True))
-        for c in candidates:
-            c = re.sub(r"(?i)invoice\s*date\s*:?", "", c).strip()
-            dt = _parse_cfmoto_datetime(c)
+        for candidate in candidates:
+            candidate = re.sub(r"(?i)invoice\s*date\s*:?", "", candidate).strip()
+            dt = _parse_cfmoto_datetime(candidate)
             if dt:
                 return dt.strftime("%Y-%m-%d %H:%M")
 
-    # 2) fallback from full page text
     page_text = soup.get_text("\n", strip=True)
     patterns = [
         r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+[A-Za-z]+\s+\d{1,2},\s+\d{4}\s*-\s*\d{1,2}:\d{2}",
@@ -370,7 +393,7 @@ def _extract_order_placed_date(soup: BeautifulSoup):
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def parse_html_and_insert(conn: sqlite3.Connection, html_text: str, forced_order_date=None):
+def parse_html_and_insert(conn, html_text: str, forced_order_date: Optional[str] = None):
     cursor = conn.cursor()
     soup = BeautifulSoup(html_text, "html.parser")
 
@@ -380,21 +403,31 @@ def parse_html_and_insert(conn: sqlite3.Connection, html_text: str, forced_order
 
     order_number = order_title.text.strip().replace("Order ", "")
 
-    cursor.execute("SELECT id, data_plasare FROM comenzi WHERE order_number = ?", (order_number,))
+    cursor.execute(
+        "SELECT id, data_plasare FROM comenzi WHERE order_number = %s",
+        (order_number,),
+    )
     existing = cursor.fetchone()
     if existing:
         if forced_order_date and existing["data_plasare"] != forced_order_date:
-            cursor.execute("UPDATE comenzi SET data_plasare = ? WHERE order_number = ?", (forced_order_date, order_number))
+            cursor.execute(
+                "UPDATE comenzi SET data_plasare = %s WHERE order_number = %s",
+                (forced_order_date, order_number),
+            )
             conn.commit()
             return order_number, 0, "updated"
         return order_number, 0, "exists"
 
     data = forced_order_date or _extract_order_placed_date(soup)
     cursor.execute(
-        "INSERT INTO comenzi (order_number, data_plasare, tip) VALUES (?, ?, 'plasata')",
+        """
+        INSERT INTO comenzi (order_number, data_plasare, tip)
+        VALUES (%s, %s, 'plasata')
+        RETURNING id
+        """,
         (order_number, data),
     )
-    comanda_id = cursor.lastrowid
+    comanda_id = cursor.fetchone()["id"]
 
     table = soup.find("table", class_="views-table")
     added = 0
@@ -419,8 +452,10 @@ def parse_html_and_insert(conn: sqlite3.Connection, html_text: str, forced_order
 
                 cursor.execute(
                     """
-                    INSERT INTO piese (comanda_id, nume_piesa, cod, cantitate, status, pret_unitar, disponibilitate_plasare)
-                    VALUES (?, ?, ?, ?, 'asteptata', ?, ?)
+                    INSERT INTO piese (
+                        comanda_id, nume_piesa, cod, cantitate, status, pret_unitar, disponibilitate_plasare
+                    )
+                    VALUES (%s, %s, %s, %s, 'asteptata', %s, %s)
                     """,
                     (comanda_id, nume, cod, cant, pret, disponibilitate),
                 )
@@ -455,7 +490,7 @@ def _extract_invoice_date(text: str):
     return datetime.now().strftime("%d.%m.%Y")
 
 
-def parse_pdf_and_insert(conn: sqlite3.Connection, file_bytes: bytes):
+def parse_pdf_and_insert(conn, file_bytes: bytes):
     cursor = conn.cursor()
     added = 0
 
@@ -466,17 +501,24 @@ def parse_pdf_and_insert(conn: sqlite3.Connection, file_bytes: bytes):
     if not order_number:
         raise ValueError("Nu am găsit numărul facturii în PDF.")
 
-    cursor.execute("SELECT id FROM comenzi WHERE order_number = ?", (order_number,))
+    cursor.execute(
+        "SELECT id FROM comenzi WHERE order_number = %s",
+        (order_number,),
+    )
     if cursor.fetchone():
         return order_number, 0, "exists"
 
     data = _extract_invoice_date(text)
 
     cursor.execute(
-        "INSERT INTO comenzi (order_number, data_plasare, tip, note) VALUES (?, ?, 'viitoare', 'Din PDF')",
+        """
+        INSERT INTO comenzi (order_number, data_plasare, tip, note)
+        VALUES (%s, %s, 'viitoare', 'Din PDF')
+        RETURNING id
+        """,
         (order_number, data),
     )
-    comanda_id = cursor.lastrowid
+    comanda_id = cursor.fetchone()["id"]
 
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -512,7 +554,7 @@ def parse_pdf_and_insert(conn: sqlite3.Connection, file_bytes: bytes):
                         cursor.execute(
                             """
                             INSERT INTO piese (comanda_id, nume_piesa, cod, cantitate, status)
-                            VALUES (?, ?, ?, ?, 'in_tranzit')
+                            VALUES (%s, %s, %s, %s, 'in_tranzit')
                             """,
                             (comanda_id, nume, cod, cant),
                         )
@@ -522,16 +564,17 @@ def parse_pdf_and_insert(conn: sqlite3.Connection, file_bytes: bytes):
     return order_number, added, "created"
 
 
-def get_comenzi(conn: sqlite3.Connection, tip: str):
+def get_comenzi(conn, tip: str):
     cursor = conn.cursor()
     cursor.execute(
         """
         SELECT c.id, c.order_number, c.data_plasare,
                COALESCE(SUM(p.cantitate - p.cantitate_primita), 0) AS lipsa
-        FROM comenzi c LEFT JOIN piese p ON c.id = p.comanda_id
-        WHERE c.tip = ?
-        GROUP BY c.id
-        HAVING lipsa > 0
+        FROM comenzi c
+        LEFT JOIN piese p ON c.id = p.comanda_id
+        WHERE c.tip = %s
+        GROUP BY c.id, c.order_number, c.data_plasare
+        HAVING COALESCE(SUM(p.cantitate - p.cantitate_primita), 0) > 0
         ORDER BY c.data_plasare DESC
         """,
         (tip,),
@@ -539,15 +582,16 @@ def get_comenzi(conn: sqlite3.Connection, tip: str):
     return cursor.fetchall()
 
 
-def get_comenzi_by_order_number(conn: sqlite3.Connection, tip: str, order_query: str):
+def get_comenzi_by_order_number(conn, tip: str, order_query: str):
     cursor = conn.cursor()
     cursor.execute(
         """
         SELECT c.id, c.order_number, c.data_plasare,
                COALESCE(SUM(p.cantitate - p.cantitate_primita), 0) AS lipsa
-        FROM comenzi c LEFT JOIN piese p ON c.id = p.comanda_id
-        WHERE c.tip = ? AND c.order_number LIKE ?
-        GROUP BY c.id
+        FROM comenzi c
+        LEFT JOIN piese p ON c.id = p.comanda_id
+        WHERE c.tip = %s AND c.order_number LIKE %s
+        GROUP BY c.id, c.order_number, c.data_plasare
         ORDER BY c.data_plasare DESC
         """,
         (tip, f"%{order_query.strip()}%"),
@@ -555,31 +599,34 @@ def get_comenzi_by_order_number(conn: sqlite3.Connection, tip: str, order_query:
     return cursor.fetchall()
 
 
-def get_comanda_id_by_order_number(conn: sqlite3.Connection, order_number: str):
+def get_comanda_id_by_order_number(conn, order_number: str):
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM comenzi WHERE order_number = ?", (order_number.strip(),))
+    cursor.execute(
+        "SELECT id FROM comenzi WHERE order_number = %s",
+        (order_number.strip(),),
+    )
     row = cursor.fetchone()
     return row["id"] if row else None
 
 
-def get_piese_for_comanda(conn: sqlite3.Connection, comanda_id: int, query_text: str = ""):
+def get_piese_for_comanda(conn, comanda_id: int, query_text: str = ""):
     cursor = conn.cursor()
     query = """
         SELECT id, cod, nume_piesa, cantitate, cantitate_primita,
                (cantitate - cantitate_primita) AS lipsa, status, data_primire,
                pret_unitar, disponibilitate_plasare
         FROM piese
-        WHERE comanda_id = ?
+        WHERE comanda_id = %s
     """
     params = [comanda_id]
 
     if query_text.strip():
-        query += " AND (cod LIKE ? OR nume_piesa LIKE ?)"
+        query += " AND (cod LIKE %s OR nume_piesa LIKE %s)"
         pattern = f"%{query_text.strip()}%"
         params += [pattern, pattern]
 
     query += " ORDER BY status, nume_piesa"
-    cursor.execute(query, params)
+    cursor.execute(query, tuple(params))
     return cursor.fetchall()
 
 
@@ -598,13 +645,13 @@ def _normalize_scanned_code(raw: str):
     return code, qty
 
 
-def _update_piece_received(conn: sqlite3.Connection, piesa_id: int, qty: float):
+def _update_piece_received(conn, piesa_id: int, qty: float):
     cursor = conn.cursor()
     cursor.execute(
         """
         SELECT cantitate, cantitate_primita
         FROM piese
-        WHERE id = ?
+        WHERE id = %s
         """,
         (piesa_id,),
     )
@@ -627,15 +674,20 @@ def _update_piece_received(conn: sqlite3.Connection, piesa_id: int, qty: float):
     cursor.execute(
         """
         UPDATE piese
-        SET cantitate_primita = ?, status = ?, data_primire = ?
-        WHERE id = ?
+        SET cantitate_primita = %s, status = %s, data_primire = %s
+        WHERE id = %s
         """,
         (primita_nou, status, data_primire, piesa_id),
     )
     conn.commit()
 
 
-def apply_received_by_code(conn: sqlite3.Connection, comanda_id: int, scanned: str, qty_override: float | None = None):
+def apply_received_by_code(
+    conn,
+    comanda_id: int,
+    scanned: str,
+    qty_override: Optional[float] = None,
+):
     code, qty_from_scan = _normalize_scanned_code(scanned)
     if not code:
         raise ValueError("Cod scanat gol.")
@@ -649,8 +701,8 @@ def apply_received_by_code(conn: sqlite3.Connection, comanda_id: int, scanned: s
         """
         SELECT id, cantitate, cantitate_primita
         FROM piese
-        WHERE comanda_id = ?
-          AND UPPER(TRIM(cod)) = UPPER(TRIM(?))
+        WHERE comanda_id = %s
+          AND UPPER(TRIM(cod)) = UPPER(TRIM(%s))
         ORDER BY id
         """,
         (comanda_id, code),
@@ -686,13 +738,14 @@ def apply_received_by_code(conn: sqlite3.Connection, comanda_id: int, scanned: s
     }
 
 
-def get_raport_asteptate(conn: sqlite3.Connection):
+def get_raport_asteptate(conn):
     cursor = conn.cursor()
     cursor.execute(
         """
         SELECT c.order_number, c.data_plasare, p.nume_piesa, p.cod,
                (p.cantitate - p.cantitate_primita) AS lipsa, p.status
-        FROM piese p JOIN comenzi c ON p.comanda_id = c.id
+        FROM piese p
+        JOIN comenzi c ON p.comanda_id = c.id
         WHERE p.cantitate > p.cantitate_primita
         ORDER BY c.data_plasare DESC, lipsa DESC
         """
@@ -700,9 +753,7 @@ def get_raport_asteptate(conn: sqlite3.Connection):
     return cursor.fetchall()
 
 
-
-
-def search_piesa_in_comenzi(conn: sqlite3.Connection, cod_query: str):
+def search_piesa_in_comenzi(conn, cod_query: str):
     cursor = conn.cursor()
     pattern = f"%{cod_query.strip()}%"
     cursor.execute(
@@ -711,7 +762,7 @@ def search_piesa_in_comenzi(conn: sqlite3.Connection, cod_query: str):
                p.pret_unitar, p.disponibilitate_plasare
         FROM piese p
         JOIN comenzi c ON c.id = p.comanda_id
-        WHERE p.cod LIKE ?
+        WHERE p.cod LIKE %s
         ORDER BY c.data_plasare DESC, c.order_number DESC
         """,
         (pattern,),
@@ -720,30 +771,21 @@ def search_piesa_in_comenzi(conn: sqlite3.Connection, cod_query: str):
 
 
 def format_piese_rows(rows):
-    def row_get(row, key, idx, default=None):
-        if isinstance(row, sqlite3.Row):
-            value = row[key]
-        elif isinstance(row, dict):
-            value = row.get(key, default)
-        else:
-            value = row[idx] if len(row) > idx else default
-        return default if value is None else value
-
     data = []
     for row in rows:
-        comandate = float(row_get(row, "cantitate", 3, 0))
-        venite = float(row_get(row, "cantitate_primita", 4, 0))
-        asteptate = float(row_get(row, "lipsa", 5, comandate - venite))
-        pret = row_get(row, "pret_unitar", 8, None)
+        comandate = float(row.get("cantitate", 0) or 0)
+        venite = float(row.get("cantitate_primita", 0) or 0)
+        asteptate = float(row.get("lipsa", comandate - venite) or 0)
+        pret = row.get("pret_unitar")
         data.append(
             {
-                "Cod piesă": str(row_get(row, "cod", 1, "")),
-                "Denumire": str(row_get(row, "nume_piesa", 2, "")),
+                "Cod piesă": str(row.get("cod", "")),
+                "Denumire": str(row.get("nume_piesa", "")),
                 "Comandate": comandate,
                 "Așteptate": asteptate,
                 "Venite": venite,
                 "Preț unitar": pret,
-                "Disponibilitate la plasare": row_get(row, "disponibilitate_plasare", 9, "") or "-",
+                "Disponibilitate la plasare": row.get("disponibilitate_plasare") or "-",
             }
         )
     return data
@@ -753,8 +795,12 @@ def main():
     st.set_page_config(page_title="Monitor Comenzi CFMoto Parts", layout="wide")
     st.title("Monitorizare Comenzi CFMOTO")
 
-    conn = get_connection()
-    init_db(conn)
+    try:
+        conn = get_connection()
+        init_db(conn)
+    except Exception as exc:
+        st.error(f"Eroare conectare la baza de date: {exc}")
+        st.stop()
 
     col1, col2 = st.columns(2)
 
@@ -771,6 +817,8 @@ def main():
                     number, added, state = parse_html_and_insert(conn, html_text)
                     if state == "exists":
                         st.info(f"{number} există deja.")
+                    elif state == "updated":
+                        st.success(f"Comanda {number} a fost actualizată.")
                     else:
                         st.success(f"Comanda {number} a fost adăugată cu {added} piese.")
                 except Exception as exc:
@@ -808,7 +856,13 @@ def main():
 
     with st.form("cfmoto_sync_form"):
         sync_orders_url = st.text_input("URL listă comenzi", value=ORDERS_URL)
-        sync_limit = st.number_input("Număr maxim comenzi de importat", min_value=1, max_value=1000, value=200, step=1)
+        sync_limit = st.number_input(
+            "Număr maxim comenzi de importat",
+            min_value=1,
+            max_value=1000,
+            value=200,
+            step=1,
+        )
 
         if sync_mode == "Login direct (fără CAPTCHA)":
             sync_user = st.text_input("User / Email cfmotoparts.eu")
@@ -847,8 +901,9 @@ def main():
                     )
 
                 st.success(
-                    f"Import gata. Noi: {result['imported']} | Actualizate: {result.get('updated', 0)} | Existente: {result['existing']} | "
-                    f"Piese noi: {result['parts']} | Linkuri detectate: {result['total_links']}"
+                    f"Import gata. Noi: {result['imported']} | Actualizate: {result.get('updated', 0)} | "
+                    f"Existente: {result['existing']} | Piese noi: {result['parts']} | "
+                    f"Linkuri detectate: {result['total_links']}"
                 )
                 if result["errors"]:
                     st.warning("Unele comenzi nu au putut fi importate:")
@@ -857,7 +912,9 @@ def main():
             except Exception as exc:
                 st.error(f"Eroare la sincronizare: {exc}")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Raport așteptate", "Căutare cod piesă"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Raport așteptate", "Căutare cod piesă"]
+    )
 
     with tab1:
         order_q1 = st.text_input("Caută după ID comandă CFMoto (ex: 2026-543)", key="order_q_plasata")
@@ -882,7 +939,13 @@ def main():
             if selected_id == 0:
                 st.warning("Nu am găsit comanda cu acest ID CFMoto.")
 
-        selected_id_num = st.number_input("Sau vezi detalii comandă (ID local)", min_value=0, step=1, value=0, key="det_plasata")
+        selected_id_num = st.number_input(
+            "Sau vezi detalii comandă (ID local)",
+            min_value=0,
+            step=1,
+            value=0,
+            key="det_plasata",
+        )
         selected_id = selected_id or int(selected_id_num)
         if selected_id > 0:
             query_text = st.text_input("Caută piesă (cod / denumire)", key="q_plasata")
@@ -893,7 +956,13 @@ def main():
             c1, c2 = st.columns(2)
             with c1:
                 manual_code = st.text_input("Cod piesă pentru recepție", key="recv_code_plasata")
-                manual_qty = st.number_input("Cantitate primită", min_value=0.0, value=1.0, step=1.0, key="recv_qty_plasata")
+                manual_qty = st.number_input(
+                    "Cantitate primită",
+                    min_value=0.0,
+                    value=1.0,
+                    step=1.0,
+                    key="recv_qty_plasata",
+                )
                 if st.button("Marchează ca primite", key="recv_btn_plasata", use_container_width=True):
                     try:
                         res = apply_received_by_code(conn, selected_id, manual_code, float(manual_qty))
@@ -912,7 +981,7 @@ def main():
                     try:
                         res = apply_received_by_code(conn, selected_id, scanned_raw)
                         msg = f"Scan aplicat pentru {res['code']}. Linii actualizate: {res['lines_updated']}."
-                        if res['qty_unapplied'] > 0:
+                        if res["qty_unapplied"] > 0:
                             msg += f" Rămas nealocat: {res['qty_unapplied']:.0f} buc."
                         st.success(msg)
                         st.rerun()
@@ -935,14 +1004,23 @@ def main():
             use_container_width=True,
         )
 
-        selected_order_no = st.text_input("Vezi detalii după ID comandă/factură CFMoto", key="det_order_viitoare")
+        selected_order_no = st.text_input(
+            "Vezi detalii după ID comandă/factură CFMoto",
+            key="det_order_viitoare",
+        )
         selected_id = 0
         if selected_order_no.strip():
             selected_id = get_comanda_id_by_order_number(conn, selected_order_no) or 0
             if selected_id == 0:
                 st.warning("Nu am găsit comanda/factura cu acest ID CFMoto.")
 
-        selected_id_num = st.number_input("Sau vezi detalii factură (ID local)", min_value=0, step=1, value=0, key="det_viitoare")
+        selected_id_num = st.number_input(
+            "Sau vezi detalii factură (ID local)",
+            min_value=0,
+            step=1,
+            value=0,
+            key="det_viitoare",
+        )
         selected_id = selected_id or int(selected_id_num)
         if selected_id > 0:
             query_text = st.text_input("Caută piesă (cod / denumire)", key="q_viitoare")
@@ -953,7 +1031,13 @@ def main():
             c1, c2 = st.columns(2)
             with c1:
                 manual_code = st.text_input("Cod piesă pentru recepție", key="recv_code_viitoare")
-                manual_qty = st.number_input("Cantitate primită", min_value=0.0, value=1.0, step=1.0, key="recv_qty_viitoare")
+                manual_qty = st.number_input(
+                    "Cantitate primită",
+                    min_value=0.0,
+                    value=1.0,
+                    step=1.0,
+                    key="recv_qty_viitoare",
+                )
                 if st.button("Marchează ca primite", key="recv_btn_viitoare", use_container_width=True):
                     try:
                         res = apply_received_by_code(conn, selected_id, manual_code, float(manual_qty))
@@ -972,7 +1056,7 @@ def main():
                     try:
                         res = apply_received_by_code(conn, selected_id, scanned_raw)
                         msg = f"Scan aplicat pentru {res['code']}. Linii actualizate: {res['lines_updated']}."
-                        if res['qty_unapplied'] > 0:
+                        if res["qty_unapplied"] > 0:
                             msg += f" Rămas nealocat: {res['qty_unapplied']:.0f} buc."
                         st.success(msg)
                         st.rerun()
@@ -994,7 +1078,6 @@ def main():
                 cod = r["cod"] or "fără cod"
                 lines.append(f"- {status_color} {r['nume_piesa']} ({cod}) — lipsă {r['lipsa']:.0f} buc")
             st.markdown("\n".join(lines))
-
 
     with tab4:
         st.subheader("Caută cod piesă în toate comenzile")
