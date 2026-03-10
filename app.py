@@ -205,7 +205,7 @@ def _get_auth_view():
     return view if view in {"login", "register"} else "login"
 
 
-def render_login_section(conn):
+def render_login_section(conn=None):
     view = _get_auth_view()
 
     st.subheader("Acces utilizatori")
@@ -251,7 +251,12 @@ def render_login_section(conn):
         st.info("Ai deja cont? Revino la login: ?auth=login")
 
 
-def require_authentication(conn):
+def require_authentication(conn=None):
+    close_after = False
+    if conn is None:
+        conn = get_connection()
+        close_after = True
+
     if "auth_role" not in st.session_state:
         st.session_state["auth_role"] = None
         st.session_state["auth_user"] = ""
@@ -260,6 +265,8 @@ def require_authentication(conn):
     role = st.session_state.get("auth_role")
     if role not in {"admin", "user"}:
         render_login_section(conn)
+        if close_after:
+            conn.close()
         return None
 
     left, right = st.columns([3, 1])
@@ -272,6 +279,8 @@ def require_authentication(conn):
             st.session_state["auth_user_id"] = None
             st.query_params["auth"] = "login"
             st.rerun()
+    if close_after:
+        conn.close()
     return role
 
 
@@ -1301,12 +1310,6 @@ def format_piese_rows(rows):
 
 def main():
     st.set_page_config(page_title="Monitor Comenzi CFMoto Parts", layout="wide")
-
-    role = require_authentication()
-    if role is None:
-        st.stop()
-
-    is_admin = role == "admin"
 
     try:
         conn = get_connection()
