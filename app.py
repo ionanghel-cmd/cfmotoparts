@@ -183,17 +183,17 @@ def _render_branding(conn):
         logo_html = ""
 
     st.markdown(
-        f"""
-        <div class='app-shell'>
-          <div class='brand-row'>
-            {logo_html}
-            <div>
-              <div class='brand-title'>{app_title}</div>
-              <div class='brand-subtitle'>Sistem comenzi / recepție / administrare utilizatori</div>
-            </div>
-          </div>
-        </div>
-        """,
+        (
+            f"<div class='app-shell'>"
+            f"<div class='brand-row'>"
+            f"{logo_html}"
+            f"<div>"
+            f"<div class='brand-title'>{app_title}</div>"
+            f"<div class='brand-subtitle'>Sistem comenzi / recepție / administrare utilizatori</div>"
+            f"</div>"
+            f"</div>"
+            f"</div>"
+        ),
         unsafe_allow_html=True,
     )
 
@@ -209,7 +209,16 @@ def render_login_section(conn=None):
     view = _get_auth_view()
 
     st.subheader("Acces utilizatori")
-    st.markdown("[Pagina Login](?auth=login) | [Pagina Înregistrare utilizator nou](?auth=register)")
+    mode = st.radio(
+        "Navigare",
+        ["Login", "Înregistrare utilizator nou"],
+        horizontal=True,
+        index=0 if view == "login" else 1,
+    )
+    view = "login" if mode == "Login" else "register"
+    st.query_params["auth"] = view
+
+    st.caption("Link direct înregistrare: ?auth=register")
 
     if view == "login":
         st.markdown("### Login")
