@@ -1286,6 +1286,12 @@ def format_piese_rows(rows):
 def main():
     st.set_page_config(page_title="Monitor Comenzi CFMoto Parts", layout="wide")
 
+    role = require_authentication()
+    if role is None:
+        st.stop()
+
+    is_admin = role == "admin"
+
     try:
         conn = get_connection()
         init_db(conn)
