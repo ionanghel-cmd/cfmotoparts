@@ -738,6 +738,131 @@ def apply_received_by_code(
     }
 
 
+def mark_piece_as_fully_received(conn, piesa_id: int):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT cantitate
+        FROM piese
+        WHERE id = %s
+        """,
+        (piesa_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        raise ValueError("Piesa nu există.")
+
+    total = float(row["cantitate"])
+    _update_piece_received(conn, piesa_id, total)
+
+
+def mark_selected_pieces_received(conn, piece_ids):
+    if not piece_ids:
+        return 0
+
+    updated = 0
+    for piece_id in piece_ids:
+        mark_piece_as_fully_received(conn, int(piece_id))
+        updated += 1
+    return updated
+
+
+def mark_order_remaining_as_received(conn, comanda_id: int):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id
+        FROM piese
+        WHERE comanda_id = %s
+          AND cantitate_primita < cantitate
+        """,
+        (comanda_id,),
+    )
+    rows = cursor.fetchall()
+    piece_ids = [int(row["id"]) for row in rows]
+    return mark_selected_pieces_received(conn, piece_ids)
+
+
+def render_reception_panel(conn, selected_id: int, detalii, key_prefix: str):
+    st.markdown("**Recepție piese (manual / scanner barcode / bife pe comandă)**")
+    c1, c2 = st.columns(2)
+    with c1:
+        manual_code = st.text_input("Cod piesă pentru recepție", key=f"recv_code_{key_prefix}")
+        manual_qty = st.number_input(
+            "Cantitate primită",
+            min_value=0.0,
+            value=1.0,
+            step=1.0,
+            key=f"recv_qty_{key_prefix}",
+        )
+        if st.button("Marchează ca primite", key=f"recv_btn_{key_prefix}", use_container_width=True):
+            try:
+                res = apply_received_by_code(conn, selected_id, manual_code, float(manual_qty))
+                st.success(f"Actualizat cod {res['code']} pe {res['lines_updated']} poziții.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Eroare recepție: {exc}")
+
+    with c2:
+        scanned_raw = st.text_input(
+            "Scan barcode (ex: 5BYV-041033-1000*1)",
+            key=f"scan_raw_{key_prefix}",
+            help="Suffix-ul *1/*2/... este interpretat ca număr de bucăți.",
+        )
+        if st.button("Aplică scan", key=f"scan_btn_{key_prefix}", use_container_width=True):
+            try:
+                res = apply_received_by_code(conn, selected_id, scanned_raw)
+                msg = f"Scan aplicat pentru {res['code']}. Linii actualizate: {res['lines_updated']}."
+                if res["qty_unapplied"] > 0:
+                    msg += f" Rămas nealocat: {res['qty_unapplied']:.0f} buc."
+                st.success(msg)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Eroare scan: {exc}")
+
+    st.markdown("**Bifează piesele venite separat**")
+    pending_rows = [row for row in detalii if float(row.get("lipsa", 0) or 0) > 0]
+    if not pending_rows:
+        st.info("Toate piesele din această comandă sunt deja recepționate.")
+        return
+
+    for row in pending_rows:
+        cod = row.get("cod") or "fără cod"
+        lipsa = float(row.get("lipsa", 0) or 0)
+        label = f"{row['nume_piesa']} ({cod}) — lipsă {lipsa:.0f} buc"
+        st.checkbox(label, key=f"recv_piece_{key_prefix}_{int(row['id'])}")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("Marchează piesele bifate ca venite", key=f"mark_checked_{key_prefix}", use_container_width=True):
+            try:
+                selected_piece_ids = [
+                    int(row["id"])
+                    for row in pending_rows
+                    if st.session_state.get(f"recv_piece_{key_prefix}_{int(row['id'])}", False)
+                ]
+                updated = mark_selected_pieces_received(conn, selected_piece_ids)
+                if updated == 0:
+                    st.warning("Nu ai bifat nicio piesă.")
+                else:
+                    st.success(f"Au fost recepționate integral {updated} piese selectate.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Eroare la recepția pe bază de bife: {exc}")
+
+    with b2:
+        if st.button("Bulk: marchează toată comanda ca venită", key=f"mark_bulk_{key_prefix}", use_container_width=True):
+            try:
+                updated = mark_order_remaining_as_received(conn, selected_id)
+                if updated == 0:
+                    st.info("Nu mai există piese în așteptare pentru această comandă.")
+                else:
+                    st.success(f"Recepție bulk finalizată: {updated} piese au fost marcate ca venite.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Eroare la recepția bulk: {exc}")
+
+
 def get_raport_asteptate(conn):
     cursor = conn.cursor()
     cursor.execute(
@@ -952,41 +1077,7 @@ def main():
             detalii = get_piese_for_comanda(conn, selected_id, query_text)
             st.dataframe(format_piese_rows(detalii), use_container_width=True)
 
-            st.markdown("**Recepție piese (manual / scanner barcode)**")
-            c1, c2 = st.columns(2)
-            with c1:
-                manual_code = st.text_input("Cod piesă pentru recepție", key="recv_code_plasata")
-                manual_qty = st.number_input(
-                    "Cantitate primită",
-                    min_value=0.0,
-                    value=1.0,
-                    step=1.0,
-                    key="recv_qty_plasata",
-                )
-                if st.button("Marchează ca primite", key="recv_btn_plasata", use_container_width=True):
-                    try:
-                        res = apply_received_by_code(conn, selected_id, manual_code, float(manual_qty))
-                        st.success(f"Actualizat cod {res['code']} pe {res['lines_updated']} poziții.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Eroare recepție: {exc}")
-
-            with c2:
-                scanned_raw = st.text_input(
-                    "Scan barcode (ex: 5BYV-041033-1000*1)",
-                    key="scan_raw_plasata",
-                    help="Suffix-ul *1/*2/... este interpretat ca număr de bucăți.",
-                )
-                if st.button("Aplică scan", key="scan_btn_plasata", use_container_width=True):
-                    try:
-                        res = apply_received_by_code(conn, selected_id, scanned_raw)
-                        msg = f"Scan aplicat pentru {res['code']}. Linii actualizate: {res['lines_updated']}."
-                        if res["qty_unapplied"] > 0:
-                            msg += f" Rămas nealocat: {res['qty_unapplied']:.0f} buc."
-                        st.success(msg)
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Eroare scan: {exc}")
+            render_reception_panel(conn, selected_id, detalii, "plasata")
 
     with tab2:
         order_q2 = st.text_input("Caută după ID comandă/factură CFMoto", key="order_q_viitoare")
@@ -1027,41 +1118,7 @@ def main():
             detalii = get_piese_for_comanda(conn, selected_id, query_text)
             st.dataframe(format_piese_rows(detalii), use_container_width=True)
 
-            st.markdown("**Recepție piese (manual / scanner barcode)**")
-            c1, c2 = st.columns(2)
-            with c1:
-                manual_code = st.text_input("Cod piesă pentru recepție", key="recv_code_viitoare")
-                manual_qty = st.number_input(
-                    "Cantitate primită",
-                    min_value=0.0,
-                    value=1.0,
-                    step=1.0,
-                    key="recv_qty_viitoare",
-                )
-                if st.button("Marchează ca primite", key="recv_btn_viitoare", use_container_width=True):
-                    try:
-                        res = apply_received_by_code(conn, selected_id, manual_code, float(manual_qty))
-                        st.success(f"Actualizat cod {res['code']} pe {res['lines_updated']} poziții.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Eroare recepție: {exc}")
-
-            with c2:
-                scanned_raw = st.text_input(
-                    "Scan barcode (ex: 5BYV-041033-1000*1)",
-                    key="scan_raw_viitoare",
-                    help="Suffix-ul *1/*2/... este interpretat ca număr de bucăți.",
-                )
-                if st.button("Aplică scan", key="scan_btn_viitoare", use_container_width=True):
-                    try:
-                        res = apply_received_by_code(conn, selected_id, scanned_raw)
-                        msg = f"Scan aplicat pentru {res['code']}. Linii actualizate: {res['lines_updated']}."
-                        if res["qty_unapplied"] > 0:
-                            msg += f" Rămas nealocat: {res['qty_unapplied']:.0f} buc."
-                        st.success(msg)
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Eroare scan: {exc}")
+            render_reception_panel(conn, selected_id, detalii, "viitoare")
 
     with tab3:
         rows = get_raport_asteptate(conn)
