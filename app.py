@@ -14,6 +14,58 @@ from psycopg2.extras import RealDictCursor
 BASE_URL = "https://cfmotoparts.eu"
 ORDERS_URL = f"{BASE_URL}/user/201/orders?order=created&sort=desc"
 
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "cfmotoparts2026"
+
+
+def authenticate_user(username: str, password: str):
+    user = (username or "").strip()
+    pwd = password or ""
+    if not user or not pwd:
+        return None
+    if user == ADMIN_USERNAME and pwd == ADMIN_PASSWORD:
+        return "admin"
+    return "user"
+
+
+def render_login_section():
+    st.subheader("Autentificare")
+    with st.form("auth_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Parolă", type="password")
+        submit = st.form_submit_button("Login")
+
+    if submit:
+        role = authenticate_user(username, password)
+        if role is None:
+            st.error("Completează username și parolă.")
+        else:
+            st.session_state["auth_role"] = role
+            st.session_state["auth_user"] = (username or "").strip()
+            st.success(f"Autentificat ca {role}.")
+            st.rerun()
+
+
+def require_authentication():
+    if "auth_role" not in st.session_state:
+        st.session_state["auth_role"] = None
+        st.session_state["auth_user"] = ""
+
+    role = st.session_state.get("auth_role")
+    if role not in {"admin", "user"}:
+        render_login_section()
+        return None
+
+    left, right = st.columns([3, 1])
+    with left:
+        st.caption(f"Utilizator conectat: {st.session_state.get('auth_user') or '-'} | Rol: {role}")
+    with right:
+        if st.button("Logout", use_container_width=True):
+            st.session_state["auth_role"] = None
+            st.session_state["auth_user"] = ""
+            st.rerun()
+    return role
+
 
 def get_connection():
     return psycopg2.connect(
@@ -738,6 +790,131 @@ def apply_received_by_code(
     }
 
 
+def mark_piece_as_fully_received(conn, piesa_id: int):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT cantitate
+        FROM piese
+        WHERE id = %s
+        """,
+        (piesa_id,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        raise ValueError("Piesa nu există.")
+
+    total = float(row["cantitate"])
+    _update_piece_received(conn, piesa_id, total)
+
+
+def mark_selected_pieces_received(conn, piece_ids):
+    if not piece_ids:
+        return 0
+
+    updated = 0
+    for piece_id in piece_ids:
+        mark_piece_as_fully_received(conn, int(piece_id))
+        updated += 1
+    return updated
+
+
+def mark_order_remaining_as_received(conn, comanda_id: int):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id
+        FROM piese
+        WHERE comanda_id = %s
+          AND cantitate_primita < cantitate
+        """,
+        (comanda_id,),
+    )
+    rows = cursor.fetchall()
+    piece_ids = [int(row["id"]) for row in rows]
+    return mark_selected_pieces_received(conn, piece_ids)
+
+
+def render_reception_panel(conn, selected_id: int, detalii, key_prefix: str):
+    st.markdown("**Recepție piese (manual / scanner barcode / bife pe comandă)**")
+    c1, c2 = st.columns(2)
+    with c1:
+        manual_code = st.text_input("Cod piesă pentru recepție", key=f"recv_code_{key_prefix}")
+        manual_qty = st.number_input(
+            "Cantitate primită",
+            min_value=0.0,
+            value=1.0,
+            step=1.0,
+            key=f"recv_qty_{key_prefix}",
+        )
+        if st.button("Marchează ca primite", key=f"recv_btn_{key_prefix}", use_container_width=True):
+            try:
+                res = apply_received_by_code(conn, selected_id, manual_code, float(manual_qty))
+                st.success(f"Actualizat cod {res['code']} pe {res['lines_updated']} poziții.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Eroare recepție: {exc}")
+
+    with c2:
+        scanned_raw = st.text_input(
+            "Scan barcode (ex: 5BYV-041033-1000*1)",
+            key=f"scan_raw_{key_prefix}",
+            help="Suffix-ul *1/*2/... este interpretat ca număr de bucăți.",
+        )
+        if st.button("Aplică scan", key=f"scan_btn_{key_prefix}", use_container_width=True):
+            try:
+                res = apply_received_by_code(conn, selected_id, scanned_raw)
+                msg = f"Scan aplicat pentru {res['code']}. Linii actualizate: {res['lines_updated']}."
+                if res["qty_unapplied"] > 0:
+                    msg += f" Rămas nealocat: {res['qty_unapplied']:.0f} buc."
+                st.success(msg)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Eroare scan: {exc}")
+
+    st.markdown("**Bifează piesele venite separat**")
+    pending_rows = [row for row in detalii if float(row.get("lipsa", 0) or 0) > 0]
+    if not pending_rows:
+        st.info("Toate piesele din această comandă sunt deja recepționate.")
+        return
+
+    for row in pending_rows:
+        cod = row.get("cod") or "fără cod"
+        lipsa = float(row.get("lipsa", 0) or 0)
+        label = f"{row['nume_piesa']} ({cod}) — lipsă {lipsa:.0f} buc"
+        st.checkbox(label, key=f"recv_piece_{key_prefix}_{int(row['id'])}")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("Marchează piesele bifate ca venite", key=f"mark_checked_{key_prefix}", use_container_width=True):
+            try:
+                selected_piece_ids = [
+                    int(row["id"])
+                    for row in pending_rows
+                    if st.session_state.get(f"recv_piece_{key_prefix}_{int(row['id'])}", False)
+                ]
+                updated = mark_selected_pieces_received(conn, selected_piece_ids)
+                if updated == 0:
+                    st.warning("Nu ai bifat nicio piesă.")
+                else:
+                    st.success(f"Au fost recepționate integral {updated} piese selectate.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Eroare la recepția pe bază de bife: {exc}")
+
+    with b2:
+        if st.button("Bulk: marchează toată comanda ca venită", key=f"mark_bulk_{key_prefix}", use_container_width=True):
+            try:
+                updated = mark_order_remaining_as_received(conn, selected_id)
+                if updated == 0:
+                    st.info("Nu mai există piese în așteptare pentru această comandă.")
+                else:
+                    st.success(f"Recepție bulk finalizată: {updated} piese au fost marcate ca venite.")
+                    st.rerun()
+            except Exception as exc:
+                st.error(f"Eroare la recepția bulk: {exc}")
+
+
 def get_raport_asteptate(conn):
     cursor = conn.cursor()
     cursor.execute(
@@ -795,6 +972,12 @@ def main():
     st.set_page_config(page_title="Monitor Comenzi CFMoto Parts", layout="wide")
     st.title("Monitorizare Comenzi CFMOTO")
 
+    role = require_authentication()
+    if role is None:
+        st.stop()
+
+    is_admin = role == "admin"
+
     try:
         conn = get_connection()
         init_db(conn)
@@ -802,119 +985,128 @@ def main():
         st.error(f"Eroare conectare la baza de date: {exc}")
         st.stop()
 
-    col1, col2 = st.columns(2)
+    if is_admin:
+        col1, col2 = st.columns(2)
 
-    with col1:
-        st.subheader("Încarcă comandă plasată (HTML)")
-        html_file = st.file_uploader("Fișier HTML", type=["html"], key="html")
-        if st.button("Importă HTML", use_container_width=True):
-            if not html_file:
-                st.warning("Alege un fișier HTML.")
-            else:
-                try:
-                    html_file.seek(0)
-                    html_text = html_file.read().decode("utf-8", errors="ignore")
-                    number, added, state = parse_html_and_insert(conn, html_text)
-                    if state == "exists":
-                        st.info(f"{number} există deja.")
-                    elif state == "updated":
-                        st.success(f"Comanda {number} a fost actualizată.")
-                    else:
-                        st.success(f"Comanda {number} a fost adăugată cu {added} piese.")
-                except Exception as exc:
-                    st.error(f"Eroare la import HTML: {exc}")
+        with col1:
+            st.subheader("Încarcă comandă plasată (HTML)")
+            html_file = st.file_uploader("Fișier HTML", type=["html"], key="html")
+            if st.button("Importă HTML", use_container_width=True):
+                if not html_file:
+                    st.warning("Alege un fișier HTML.")
+                else:
+                    try:
+                        html_file.seek(0)
+                        html_text = html_file.read().decode("utf-8", errors="ignore")
+                        number, added, state = parse_html_and_insert(conn, html_text)
+                        if state == "exists":
+                            st.info(f"{number} există deja.")
+                        elif state == "updated":
+                            st.success(f"Comanda {number} a fost actualizată.")
+                        else:
+                            st.success(f"Comanda {number} a fost adăugată cu {added} piese.")
+                    except Exception as exc:
+                        st.error(f"Eroare la import HTML: {exc}")
 
-    with col2:
-        st.subheader("Încarcă invoice viitoare (PDF)")
-        pdf_file = st.file_uploader("Fișier PDF", type=["pdf"], key="pdf")
-        if st.button("Importă PDF", use_container_width=True):
-            if not pdf_file:
-                st.warning("Alege un fișier PDF.")
-            else:
-                try:
-                    pdf_file.seek(0)
-                    file_bytes = pdf_file.read()
-                    number, added, state = parse_pdf_and_insert(conn, file_bytes)
-                    if state == "exists":
-                        st.info(f"{number} există deja.")
-                    else:
-                        st.success(f"Factura {number} a fost adăugată cu {added} piese viitoare.")
-                except Exception as exc:
-                    st.error(f"Eroare la import PDF: {exc}")
+        with col2:
+            st.subheader("Încarcă invoice viitoare (PDF)")
+            pdf_file = st.file_uploader("Fișier PDF", type=["pdf"], key="pdf")
+            if st.button("Importă PDF", use_container_width=True):
+                if not pdf_file:
+                    st.warning("Alege un fișier PDF.")
+                else:
+                    try:
+                        pdf_file.seek(0)
+                        file_bytes = pdf_file.read()
+                        number, added, state = parse_pdf_and_insert(conn, file_bytes)
+                        if state == "exists":
+                            st.info(f"{number} există deja.")
+                        else:
+                            st.success(f"Factura {number} a fost adăugată cu {added} piese viitoare.")
+                    except Exception as exc:
+                        st.error(f"Eroare la import PDF: {exc}")
 
-    st.subheader("Sincronizare comenzi din cfmotoparts.eu")
-    st.info(
-        "Se face login la https://cfmotoparts.eu/user/login, apoi se citește lista din orders și fiecare link din Order number. "
-        "Dacă apare CAPTCHA, folosește metoda cu cookie de sesiune (login manual în browser)."
-    )
-
-    sync_mode = st.radio(
-        "Metodă sincronizare",
-        ["Login direct (fără CAPTCHA)", "Cookie de sesiune (compatibil CAPTCHA)"],
-        horizontal=True,
-    )
-
-    with st.form("cfmoto_sync_form"):
-        sync_orders_url = st.text_input("URL listă comenzi", value=ORDERS_URL)
-        sync_limit = st.number_input(
-            "Număr maxim comenzi de importat",
-            min_value=1,
-            max_value=1000,
-            value=200,
-            step=1,
+        st.subheader("Sincronizare comenzi din cfmotoparts.eu")
+        st.info(
+            "Se face login la https://cfmotoparts.eu/user/login, apoi se citește lista din orders și fiecare link din Order number. "
+            "Dacă apare CAPTCHA, folosește metoda cu cookie de sesiune (login manual în browser)."
         )
 
-        if sync_mode == "Login direct (fără CAPTCHA)":
-            sync_user = st.text_input("User / Email cfmotoparts.eu")
-            sync_pass = st.text_input("Parolă", type="password")
-            sync_cookie = ""
-        else:
-            sync_user = ""
-            sync_pass = ""
-            sync_cookie = st.text_area(
-                "Cookie header din browser",
-                placeholder="Ex: SESSxxxx=...; has_js=1; ...",
-                height=110,
+        sync_mode = st.radio(
+            "Metodă sincronizare",
+            ["Login direct (fără CAPTCHA)", "Cookie de sesiune (compatibil CAPTCHA)"],
+            horizontal=True,
+        )
+
+        with st.form("cfmoto_sync_form"):
+            sync_orders_url = st.text_input("URL listă comenzi", value=ORDERS_URL)
+            sync_limit = st.number_input(
+                "Număr maxim comenzi de importat",
+                min_value=1,
+                max_value=1000,
+                value=200,
+                step=1,
             )
 
-        sync_submit = st.form_submit_button("Import comenzi")
-
-    if sync_submit:
-        with st.spinner("Import în curs..."):
-            try:
-                if sync_mode == "Login direct (fără CAPTCHA)":
-                    if not sync_user or not sync_pass:
-                        raise ValueError("Completează user și parolă.")
-                    result = import_orders_from_account(
-                        conn,
-                        sync_user,
-                        sync_pass,
-                        orders_url=sync_orders_url.strip() or ORDERS_URL,
-                        limit=int(sync_limit),
-                    )
-                else:
-                    result = import_orders_from_cookie(
-                        conn,
-                        sync_cookie,
-                        orders_url=sync_orders_url.strip() or ORDERS_URL,
-                        limit=int(sync_limit),
-                    )
-
-                st.success(
-                    f"Import gata. Noi: {result['imported']} | Actualizate: {result.get('updated', 0)} | "
-                    f"Existente: {result['existing']} | Piese noi: {result['parts']} | "
-                    f"Linkuri detectate: {result['total_links']}"
+            if sync_mode == "Login direct (fără CAPTCHA)":
+                sync_user = st.text_input("User / Email cfmotoparts.eu")
+                sync_pass = st.text_input("Parolă", type="password")
+                sync_cookie = ""
+            else:
+                sync_user = ""
+                sync_pass = ""
+                sync_cookie = st.text_area(
+                    "Cookie header din browser",
+                    placeholder="Ex: SESSxxxx=...; has_js=1; ...",
+                    height=110,
                 )
-                if result["errors"]:
-                    st.warning("Unele comenzi nu au putut fi importate:")
-                    for err in result["errors"][:10]:
-                        st.write(f"- {err}")
-            except Exception as exc:
-                st.error(f"Eroare la sincronizare: {exc}")
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Raport așteptate", "Căutare cod piesă"]
-    )
+            sync_submit = st.form_submit_button("Import comenzi")
+
+        if sync_submit:
+            with st.spinner("Import în curs..."):
+                try:
+                    if sync_mode == "Login direct (fără CAPTCHA)":
+                        if not sync_user or not sync_pass:
+                            raise ValueError("Completează user și parolă.")
+                        result = import_orders_from_account(
+                            conn,
+                            sync_user,
+                            sync_pass,
+                            orders_url=sync_orders_url.strip() or ORDERS_URL,
+                            limit=int(sync_limit),
+                        )
+                    else:
+                        result = import_orders_from_cookie(
+                            conn,
+                            sync_cookie,
+                            orders_url=sync_orders_url.strip() or ORDERS_URL,
+                            limit=int(sync_limit),
+                        )
+
+                    st.success(
+                        f"Import gata. Noi: {result['imported']} | Actualizate: {result.get('updated', 0)} | "
+                        f"Existente: {result['existing']} | Piese noi: {result['parts']} | "
+                        f"Linkuri detectate: {result['total_links']}"
+                    )
+                    if result["errors"]:
+                        st.warning("Unele comenzi nu au putut fi importate:")
+                        for err in result["errors"][:10]:
+                            st.write(f"- {err}")
+                except Exception as exc:
+                    st.error(f"Eroare la sincronizare: {exc}")
+    else:
+        st.info("Ești logat ca utilizator simplu. Doar admin poate importa comenzi sau încărca fișiere.")
+
+    if is_admin:
+        tab1, tab2, tab3, tab4 = st.tabs(
+            ["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Raport așteptate", "Căutare cod piesă"]
+        )
+    else:
+        tab1, tab2, tab4 = st.tabs(
+            ["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Căutare cod piesă"]
+        )
+        tab3 = None
 
     with tab1:
         order_q1 = st.text_input("Caută după ID comandă CFMoto (ex: 2026-543)", key="order_q_plasata")
@@ -952,41 +1144,10 @@ def main():
             detalii = get_piese_for_comanda(conn, selected_id, query_text)
             st.dataframe(format_piese_rows(detalii), use_container_width=True)
 
-            st.markdown("**Recepție piese (manual / scanner barcode)**")
-            c1, c2 = st.columns(2)
-            with c1:
-                manual_code = st.text_input("Cod piesă pentru recepție", key="recv_code_plasata")
-                manual_qty = st.number_input(
-                    "Cantitate primită",
-                    min_value=0.0,
-                    value=1.0,
-                    step=1.0,
-                    key="recv_qty_plasata",
-                )
-                if st.button("Marchează ca primite", key="recv_btn_plasata", use_container_width=True):
-                    try:
-                        res = apply_received_by_code(conn, selected_id, manual_code, float(manual_qty))
-                        st.success(f"Actualizat cod {res['code']} pe {res['lines_updated']} poziții.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Eroare recepție: {exc}")
-
-            with c2:
-                scanned_raw = st.text_input(
-                    "Scan barcode (ex: 5BYV-041033-1000*1)",
-                    key="scan_raw_plasata",
-                    help="Suffix-ul *1/*2/... este interpretat ca număr de bucăți.",
-                )
-                if st.button("Aplică scan", key="scan_btn_plasata", use_container_width=True):
-                    try:
-                        res = apply_received_by_code(conn, selected_id, scanned_raw)
-                        msg = f"Scan aplicat pentru {res['code']}. Linii actualizate: {res['lines_updated']}."
-                        if res["qty_unapplied"] > 0:
-                            msg += f" Rămas nealocat: {res['qty_unapplied']:.0f} buc."
-                        st.success(msg)
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Eroare scan: {exc}")
+            if is_admin:
+                render_reception_panel(conn, selected_id, detalii, "plasata")
+            else:
+                st.info("Doar admin poate marca piese ca venite.")
 
     with tab2:
         order_q2 = st.text_input("Caută după ID comandă/factură CFMoto", key="order_q_viitoare")
@@ -1027,57 +1188,27 @@ def main():
             detalii = get_piese_for_comanda(conn, selected_id, query_text)
             st.dataframe(format_piese_rows(detalii), use_container_width=True)
 
-            st.markdown("**Recepție piese (manual / scanner barcode)**")
-            c1, c2 = st.columns(2)
-            with c1:
-                manual_code = st.text_input("Cod piesă pentru recepție", key="recv_code_viitoare")
-                manual_qty = st.number_input(
-                    "Cantitate primită",
-                    min_value=0.0,
-                    value=1.0,
-                    step=1.0,
-                    key="recv_qty_viitoare",
-                )
-                if st.button("Marchează ca primite", key="recv_btn_viitoare", use_container_width=True):
-                    try:
-                        res = apply_received_by_code(conn, selected_id, manual_code, float(manual_qty))
-                        st.success(f"Actualizat cod {res['code']} pe {res['lines_updated']} poziții.")
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Eroare recepție: {exc}")
+            if is_admin:
+                render_reception_panel(conn, selected_id, detalii, "viitoare")
+            else:
+                st.info("Doar admin poate marca piese ca venite.")
 
-            with c2:
-                scanned_raw = st.text_input(
-                    "Scan barcode (ex: 5BYV-041033-1000*1)",
-                    key="scan_raw_viitoare",
-                    help="Suffix-ul *1/*2/... este interpretat ca număr de bucăți.",
-                )
-                if st.button("Aplică scan", key="scan_btn_viitoare", use_container_width=True):
-                    try:
-                        res = apply_received_by_code(conn, selected_id, scanned_raw)
-                        msg = f"Scan aplicat pentru {res['code']}. Linii actualizate: {res['lines_updated']}."
-                        if res["qty_unapplied"] > 0:
-                            msg += f" Rămas nealocat: {res['qty_unapplied']:.0f} buc."
-                        st.success(msg)
-                        st.rerun()
-                    except Exception as exc:
-                        st.error(f"Eroare scan: {exc}")
-
-    with tab3:
-        rows = get_raport_asteptate(conn)
-        if not rows:
-            st.info("Nimic în așteptare.")
-        else:
-            lines = []
-            current_com = None
-            for r in rows:
-                if r["order_number"] != current_com:
-                    lines.append(f"\n### {r['order_number']} ({r['data_plasare']})")
-                    current_com = r["order_number"]
-                status_color = "🔴" if r["status"] == "asteptata" else "🟡" if r["status"] == "in_tranzit" else "🟢"
-                cod = r["cod"] or "fără cod"
-                lines.append(f"- {status_color} {r['nume_piesa']} ({cod}) — lipsă {r['lipsa']:.0f} buc")
-            st.markdown("\n".join(lines))
+    if is_admin and tab3 is not None:
+        with tab3:
+            rows = get_raport_asteptate(conn)
+            if not rows:
+                st.info("Nimic în așteptare.")
+            else:
+                lines = []
+                current_com = None
+                for r in rows:
+                    if r["order_number"] != current_com:
+                        lines.append(f"\n### {r['order_number']} ({r['data_plasare']})")
+                        current_com = r["order_number"]
+                    status_color = "🔴" if r["status"] == "asteptata" else "🟡" if r["status"] == "in_tranzit" else "🟢"
+                    cod = r["cod"] or "fără cod"
+                    lines.append(f"- {status_color} {r['nume_piesa']} ({cod}) — lipsă {r['lipsa']:.0f} buc")
+                st.markdown("\n".join(lines))
 
     with tab4:
         st.subheader("Caută cod piesă în toate comenzile")
