@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import io
 import re
 from datetime import datetime
@@ -16,44 +18,248 @@ ORDERS_URL = f"{BASE_URL}/user/201/orders?order=created&sort=desc"
 
 ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "cfmotoparts2026"
+DEFAULT_LOGO_TEXT = "CFMOTO Parts"
 
 
-def authenticate_user(username: str, password: str):
+def _hash_password(raw_password: str):
+    return hashlib.sha256((raw_password or "").encode("utf-8")).hexdigest()
+
+
+def _get_app_setting(conn, key: str, default_value: str = ""):
+    cursor = conn.cursor()
+    cursor.execute("SELECT setting_value FROM app_settings WHERE setting_key = %s", (key,))
+    row = cursor.fetchone()
+    return row["setting_value"] if row else default_value
+
+
+def _set_app_setting(conn, key: str, value: str):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO app_settings (setting_key, setting_value, updated_at)
+        VALUES (%s, %s, NOW())
+        ON CONFLICT (setting_key)
+        DO UPDATE SET setting_value = EXCLUDED.setting_value, updated_at = NOW()
+        """,
+        (key, value),
+    )
+    conn.commit()
+
+
+def _ensure_default_admin(conn):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO utilizatori (username, password_hash, role, is_approved, approved_by)
+        VALUES (%s, %s, 'admin', TRUE, %s)
+        ON CONFLICT (username) DO NOTHING
+        """,
+        (ADMIN_USERNAME, _hash_password(ADMIN_PASSWORD), ADMIN_USERNAME),
+    )
+    conn.commit()
+
+
+def authenticate_user(conn, username: str, password: str):
     user = (username or "").strip()
     pwd = password or ""
     if not user or not pwd:
         return None
-    if user == ADMIN_USERNAME and pwd == ADMIN_PASSWORD:
-        return "admin"
-    return "user"
+
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, username, role, is_approved, password_hash
+        FROM utilizatori
+        WHERE username = %s
+        """,
+        (user,),
+    )
+    row = cursor.fetchone()
+    if not row:
+        return {"status": "invalid"}
+
+    if row["password_hash"] != _hash_password(pwd):
+        return {"status": "invalid"}
+
+    if row["role"] != "admin" and not row["is_approved"]:
+        return {"status": "pending"}
+
+    return {
+        "status": "ok",
+        "user_id": int(row["id"]),
+        "username": row["username"],
+        "role": row["role"],
+    }
 
 
-def render_login_section():
-    st.subheader("Autentificare")
-    with st.form("auth_form"):
-        username = st.text_input("Username")
-        password = st.text_input("Parolă", type="password")
-        submit = st.form_submit_button("Login")
+def register_user(conn, username: str, password: str):
+    user = (username or "").strip()
+    pwd = password or ""
+    if len(user) < 3:
+        raise ValueError("Username trebuie să aibă minim 3 caractere.")
+    if len(pwd) < 6:
+        raise ValueError("Parola trebuie să aibă minim 6 caractere.")
 
-    if submit:
-        role = authenticate_user(username, password)
-        if role is None:
-            st.error("Completează username și parolă.")
-        else:
-            st.session_state["auth_role"] = role
-            st.session_state["auth_user"] = (username or "").strip()
-            st.success(f"Autentificat ca {role}.")
-            st.rerun()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM utilizatori WHERE username = %s", (user,))
+    if cursor.fetchone():
+        raise ValueError("Username deja existent.")
+
+    cursor.execute(
+        """
+        INSERT INTO utilizatori (username, password_hash, role, is_approved)
+        VALUES (%s, %s, 'user', FALSE)
+        """,
+        (user, _hash_password(pwd)),
+    )
+    conn.commit()
 
 
-def require_authentication():
+def get_pending_users(conn):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, username, role, is_approved, created_at
+        FROM utilizatori
+        WHERE role = 'user' AND is_approved = FALSE
+        ORDER BY created_at ASC
+        """
+    )
+    return cursor.fetchall()
+
+
+def get_all_users(conn):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        SELECT id, username, role, is_approved, created_at, approved_by, approved_at
+        FROM utilizatori
+        ORDER BY role DESC, created_at DESC
+        """
+    )
+    return cursor.fetchall()
+
+
+def approve_user(conn, user_id: int, admin_username: str):
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE utilizatori
+        SET is_approved = TRUE,
+            approved_by = %s,
+            approved_at = NOW()
+        WHERE id = %s AND role = 'user'
+        """,
+        (admin_username, user_id),
+    )
+    conn.commit()
+
+
+def delete_user(conn, user_id: int):
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM utilizatori WHERE id = %s AND role = 'user'", (user_id,))
+    conn.commit()
+
+
+def _render_branding(conn):
+    logo_b64 = _get_app_setting(conn, "logo_base64", "")
+    app_title = _get_app_setting(conn, "app_title", "Monitorizare Comenzi CFMOTO")
+    st.markdown(
+        """
+        <style>
+        .app-shell {background: linear-gradient(90deg,#0f172a,#1e293b); border-radius:12px; padding:14px 18px; margin-bottom:12px;}
+        .brand-row {display:flex; align-items:center; gap:14px;}
+        .brand-row img {height:54px; border-radius:10px; background:#fff; padding:4px;}
+        .brand-title {color:#fff; font-size:1.5rem; font-weight:700;}
+        .brand-subtitle {color:#cbd5e1; font-size:0.9rem;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if logo_b64:
+        logo_html = f'<img src="data:image/png;base64,{logo_b64}" alt="logo" />'
+    else:
+        logo_html = ""
+
+    st.markdown(
+        f"""
+        <div class='app-shell'>
+          <div class='brand-row'>
+            {logo_html}
+            <div>
+              <div class='brand-title'>{app_title}</div>
+              <div class='brand-subtitle'>Sistem comenzi / recepție / administrare utilizatori</div>
+            </div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _get_auth_view():
+    view = st.query_params.get("auth", "login")
+    if isinstance(view, list):
+        view = view[0] if view else "login"
+    return view if view in {"login", "register"} else "login"
+
+
+def render_login_section(conn):
+    view = _get_auth_view()
+
+    st.subheader("Acces utilizatori")
+    st.markdown("[Pagina Login](?auth=login) | [Pagina Înregistrare utilizator nou](?auth=register)")
+
+    if view == "login":
+        st.markdown("### Login")
+        with st.form("auth_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Parolă", type="password")
+            submit = st.form_submit_button("Login")
+
+        if submit:
+            result = authenticate_user(conn, username, password)
+            status = result.get("status") if result else None
+            if status == "ok":
+                st.session_state["auth_role"] = result["role"]
+                st.session_state["auth_user"] = result["username"]
+                st.session_state["auth_user_id"] = result["user_id"]
+                st.query_params["auth"] = "login"
+                st.success(f"Autentificat ca {result['role']}.")
+                st.rerun()
+            elif status == "pending":
+                st.warning("Contul tău este în așteptarea aprobării adminului.")
+            else:
+                st.error("Username sau parolă incorectă.")
+
+        st.info("Nu ai cont? Intră pe pagina de înregistrare: ?auth=register")
+    else:
+        st.markdown("### Înregistrare utilizator nou")
+        with st.form("register_form"):
+            new_user = st.text_input("Username nou")
+            new_pass = st.text_input("Parolă nouă", type="password")
+            submit_register = st.form_submit_button("Creează cont")
+
+        if submit_register:
+            try:
+                register_user(conn, new_user, new_pass)
+                st.success("Cont creat. Așteaptă aprobarea adminului pentru acces.")
+            except Exception as exc:
+                st.error(f"Eroare înregistrare: {exc}")
+
+        st.info("Ai deja cont? Revino la login: ?auth=login")
+
+
+def require_authentication(conn):
     if "auth_role" not in st.session_state:
         st.session_state["auth_role"] = None
         st.session_state["auth_user"] = ""
+        st.session_state["auth_user_id"] = None
 
     role = st.session_state.get("auth_role")
     if role not in {"admin", "user"}:
-        render_login_section()
+        render_login_section(conn)
         return None
 
     left, right = st.columns([3, 1])
@@ -63,8 +269,99 @@ def require_authentication():
         if st.button("Logout", use_container_width=True):
             st.session_state["auth_role"] = None
             st.session_state["auth_user"] = ""
+            st.session_state["auth_user_id"] = None
+            st.query_params["auth"] = "login"
             st.rerun()
     return role
+
+
+def render_admin_panel(conn):
+    st.subheader("Admin Panel")
+    st.markdown("Gestionează utilizatori și branding-ul aplicației.")
+
+    u1, u2 = st.columns(2)
+    with u1:
+        st.markdown("**Utilizatori în așteptare aprobare**")
+        pending = get_pending_users(conn)
+        if not pending:
+            st.info("Nu există utilizatori în așteptare.")
+        else:
+            for user in pending:
+                row1, row2, row3 = st.columns([4, 1, 1])
+                with row1:
+                    st.write(f"{user['username']} (creat: {user['created_at']})")
+                with row2:
+                    if st.button("Aprobă", key=f"approve_user_{user['id']}"):
+                        approve_user(conn, int(user["id"]), st.session_state.get("auth_user", "admin"))
+                        st.success(f"Utilizatorul {user['username']} a fost aprobat.")
+                        st.rerun()
+                with row3:
+                    if st.button("Șterge", key=f"delete_pending_{user['id']}"):
+                        delete_user(conn, int(user["id"]))
+                        st.success(f"Utilizatorul {user['username']} a fost șters.")
+                        st.rerun()
+
+        st.markdown("**Toți utilizatorii**")
+        all_users = get_all_users(conn)
+        st.dataframe(
+            [
+                {
+                    "ID": r["id"],
+                    "Username": r["username"],
+                    "Rol": r["role"],
+                    "Aprobat": "Da" if r["is_approved"] else "Nu",
+                    "Creat la": str(r["created_at"]),
+                    "Aprobat de": r["approved_by"] or "-",
+                    "Aprobat la": str(r["approved_at"] or "-"),
+                }
+                for r in all_users
+            ],
+            use_container_width=True,
+        )
+
+    with u2:
+        st.markdown("**Branding (logo + titlu)**")
+        current_title = _get_app_setting(conn, "app_title", "Monitorizare Comenzi CFMOTO")
+        with st.form("branding_form"):
+            new_title = st.text_input("Titlu aplicație", value=current_title)
+            logo_file = st.file_uploader("Încarcă logo (PNG/JPG)", type=["png", "jpg", "jpeg"], key="branding_logo")
+            save_branding = st.form_submit_button("Salvează branding")
+
+        if save_branding:
+            try:
+                _set_app_setting(conn, "app_title", new_title.strip() or "Monitorizare Comenzi CFMOTO")
+                if logo_file:
+                    logo_file.seek(0)
+                    logo_b64 = base64.b64encode(logo_file.read()).decode("utf-8")
+                    _set_app_setting(conn, "logo_base64", logo_b64)
+                st.success("Branding salvat.")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Eroare la salvarea branding-ului: {exc}")
+
+    with st.expander("SQL tabele necesare pentru sistemul de utilizatori + branding"):
+        st.code(
+            """
+CREATE TABLE IF NOT EXISTS utilizatori (
+    id BIGSERIAL PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    is_approved BOOLEAN NOT NULL DEFAULT FALSE,
+    approved_by TEXT,
+    approved_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    id BIGSERIAL PRIMARY KEY,
+    setting_key TEXT UNIQUE NOT NULL,
+    setting_value TEXT,
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+            """.strip(),
+            language="sql",
+        )
 
 
 def get_connection():
@@ -112,6 +409,32 @@ def init_db(conn) -> None:
     )
 
     cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS utilizatori (
+            id BIGSERIAL PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            is_approved BOOLEAN NOT NULL DEFAULT FALSE,
+            approved_by TEXT,
+            approved_at TIMESTAMP,
+            created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_settings (
+            id BIGSERIAL PRIMARY KEY,
+            setting_key TEXT UNIQUE NOT NULL,
+            setting_value TEXT,
+            updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+        )
+        """
+    )
+
+    cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_comenzi_order_number ON comenzi(order_number)"
     )
     cursor.execute(
@@ -126,8 +449,16 @@ def init_db(conn) -> None:
     cursor.execute(
         "CREATE INDEX IF NOT EXISTS idx_piese_status ON piese(status)"
     )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_utilizatori_role_approved ON utilizatori(role, is_approved)"
+    )
 
     conn.commit()
+    _ensure_default_admin(conn)
+    if not _get_app_setting(conn, "app_title", ""):
+        _set_app_setting(conn, "app_title", "Monitorizare Comenzi CFMOTO")
+    if not _get_app_setting(conn, "logo_text", ""):
+        _set_app_setting(conn, "logo_text", DEFAULT_LOGO_TEXT)
 
 
 def _extract_csrf_login_fields(html_text: str):
@@ -970,7 +1301,6 @@ def format_piese_rows(rows):
 
 def main():
     st.set_page_config(page_title="Monitor Comenzi CFMoto Parts", layout="wide")
-    st.title("Monitorizare Comenzi CFMOTO")
 
     role = require_authentication()
     if role is None:
@@ -984,6 +1314,15 @@ def main():
     except Exception as exc:
         st.error(f"Eroare conectare la baza de date: {exc}")
         st.stop()
+
+    _render_branding(conn)
+
+    role = require_authentication(conn)
+    if role is None:
+        conn.close()
+        st.stop()
+
+    is_admin = role == "admin"
 
     if is_admin:
         col1, col2 = st.columns(2)
@@ -1099,14 +1438,21 @@ def main():
         st.info("Ești logat ca utilizator simplu. Doar admin poate importa comenzi sau încărca fișiere.")
 
     if is_admin:
-        tab1, tab2, tab3, tab4 = st.tabs(
-            ["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Raport așteptate", "Căutare cod piesă"]
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(
+            [
+                "Comenzi plasate (HTML)",
+                "Invoice viitoare (PDF)",
+                "Raport așteptate",
+                "Căutare cod piesă",
+                "Admin Panel",
+            ]
         )
     else:
         tab1, tab2, tab4 = st.tabs(
             ["Comenzi plasate (HTML)", "Invoice viitoare (PDF)", "Căutare cod piesă"]
         )
         tab3 = None
+        tab5 = None
 
     with tab1:
         order_q1 = st.text_input("Caută după ID comandă CFMoto (ex: 2026-543)", key="order_q_plasata")
@@ -1233,6 +1579,10 @@ def main():
                     ],
                     use_container_width=True,
                 )
+
+    if is_admin and tab5 is not None:
+        with tab5:
+            render_admin_panel(conn)
 
     st.caption(
         "Pentru import masiv (până la 1000), aplicația parcurge și paginile următoare din orders (?page=1,2,3...). "
