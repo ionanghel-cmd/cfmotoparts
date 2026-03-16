@@ -1578,6 +1578,8 @@ def main():
                             sync_orders_url.strip() or ORDERS_URL,
                         )
                     else:
+                        if not sync_cookie.strip():
+                            raise ValueError("Completează cookie-ul de sesiune pentru import prin cookie.")
                         session, _ = fetch_orders_html_with_cookie(
                             sync_orders_url.strip() or ORDERS_URL,
                             sync_cookie,
@@ -1610,40 +1612,48 @@ def main():
 
         prepared_orders = st.session_state.get("sync_prepared_orders", [])
         if prepared_orders:
-            st.markdown("#### Selectează comenzile pe care vrei să le imporți")
-            options = [
-                f"{o['order_number']} | {o.get('created_at') or '-'} | {len(o.get('parts', []))} piese"
-                for o in prepared_orders
-            ]
-            option_to_order = {opt: prepared_orders[idx] for idx, opt in enumerate(options)}
+            st.markdown("#### Comenzi neimportate detectate (prin cookie/login)")
+            st.dataframe(
+                [
+                    {
+                        "Comandă": o["order_number"],
+                        "Data": o.get("created_at") or "-",
+                        "Nr piese": len(o.get("parts", [])),
+                    }
+                    for o in prepared_orders
+                ],
+                use_container_width=True,
+            )
 
-            selected_options = st.multiselect(
-                "Comenzi neimportate",
-                options,
-                default=options,
+            order_numbers = [o["order_number"] for o in prepared_orders]
+            order_by_number = {o["order_number"]: o for o in prepared_orders}
+
+            selected_numbers = st.multiselect(
+                "Alege comenzile pe care vrei să le imporți",
+                order_numbers,
+                default=order_numbers,
                 key="sync_selected_orders",
             )
 
             with st.expander("Preview piese pe comandă (click pe comandă)", expanded=False):
-                order_choice = st.selectbox("Alege comanda", options, index=0, key="sync_preview_choice")
-                chosen_order = option_to_order[order_choice]
+                order_choice = st.selectbox("Alege comanda", order_numbers, index=0, key="sync_preview_choice")
+                chosen_order = order_by_number[order_choice]
                 st.caption(f"Comanda {chosen_order['order_number']} are {len(chosen_order.get('parts', []))} piese.")
                 st.dataframe(
                     [
                         {
-                            "Cod": p.get("cod", ""),
-                            "Denumire": p.get("nume", ""),
-                            "Cantitate": p.get("cantitate", 0),
-                            "Preț": p.get("pret", None),
-                            "Disponibilitate": p.get("disponibilitate", ""),
+                            "Cod": part.get("cod", ""),
+                            "Denumire": part.get("nume", ""),
+                            "Cantitate": part.get("cantitate", 0),
+                            "Preț": part.get("pret", None),
+                            "Disponibilitate": part.get("disponibilitate", ""),
                         }
-                        for p in chosen_order.get("parts", [])
+                        for part in chosen_order.get("parts", [])
                     ],
                     use_container_width=True,
                 )
 
             if st.button("Importă comenzile selectate", type="primary", use_container_width=True):
-                selected_numbers = [option_to_order[o]["order_number"] for o in selected_options]
                 with st.spinner("Import în curs..."):
                     try:
                         result = import_selected_orders(conn, prepared_orders, selected_numbers)
@@ -1662,6 +1672,8 @@ def main():
                         st.session_state["sync_prepared_orders"] = remaining
                     except Exception as exc:
                         st.error(f"Eroare la importul selectat: {exc}")
+        elif st.session_state.get("sync_prepared_meta") is not None:
+            st.info("Nu există comenzi noi de importat. Toate comenzile detectate sunt deja importate.")
     else:
         st.info("Ești logat ca utilizator simplu. Doar admin poate importa comenzi sau încărca fișiere.")
 
