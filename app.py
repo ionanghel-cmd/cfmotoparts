@@ -596,14 +596,28 @@ def extract_order_entries(orders_html: str):
             href = a["href"]
             text = a.get_text(" ", strip=True)
             if any(re.search(pattern, href) for pattern in order_patterns) or re.match(r"^\d{4}-\d+", text):
-                entries.append({"link": urljoin(BASE_URL, href), "created_at": created_at})
+                order_number = text if re.match(r"^\d{4}-\d+", text) else None
+                entries.append(
+                    {
+                        "link": urljoin(BASE_URL, href),
+                        "created_at": created_at,
+                        "order_number": order_number,
+                    }
+                )
 
     if not entries:
         for a in soup.find_all("a", href=True):
             href = a["href"]
             text = a.get_text(" ", strip=True)
             if any(re.search(pattern, href) for pattern in order_patterns) or re.match(r"^\d{4}-\d+", text):
-                entries.append({"link": urljoin(BASE_URL, href), "created_at": None})
+                order_number = text if re.match(r"^\d{4}-\d+", text) else None
+                entries.append(
+                    {
+                        "link": urljoin(BASE_URL, href),
+                        "created_at": None,
+                        "order_number": order_number,
+                    }
+                )
 
     seen = set()
     deduped = []
@@ -794,15 +808,165 @@ def _extract_order_placed_date(soup: BeautifulSoup):
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def parse_html_and_insert(conn, html_text: str, forced_order_date: Optional[str] = None):
-    cursor = conn.cursor()
-    soup = BeautifulSoup(html_text, "html.parser")
+def _extract_parts_from_order_soup(soup: BeautifulSoup):
+    parts = []
+    table = soup.find("table", class_="views-table")
+    if not (table and table.find("tbody")):
+        return parts
 
+    for row in table.find("tbody").find_all("tr"):
+        cols = row.find_all("td")
+        if len(cols) < 4:
+            continue
+
+        raw_desc = cols[1].get_text(" ", strip=True)
+        disponibilitate = _extract_availability(raw_desc)
+        nume = raw_desc.replace("sufficient stock", "").strip()
+        cod_match = re.search(r"\(([\w-]+)\)", nume)
+        cod = cod_match.group(1) if cod_match else ""
+
+        qty_cell = cols[3].get_text(" ", strip=True)
+        try:
+            cant = float(re.sub(r"[^0-9.,-]", "", qty_cell).replace(",", ".") or "1")
+        except (ValueError, TypeError):
+            cant = 1.0
+
+        price_text = " ".join(c.get_text(" ", strip=True) for c in cols)
+        pret = _extract_price_from_text(price_text)
+
+        parts.append(
+            {
+                "nume": nume,
+                "cod": cod,
+                "cantitate": cant,
+                "pret": pret,
+                "disponibilitate": disponibilitate,
+            }
+        )
+    return parts
+
+
+def parse_order_html_details(html_text: str):
+    soup = BeautifulSoup(html_text, "html.parser")
     order_title = soup.find("h1", class_="page-header")
     if not order_title:
         raise ValueError("Nu am găsit numărul comenzii în HTML.")
 
     order_number = order_title.text.strip().replace("Order ", "")
+    data = _extract_order_placed_date(soup)
+    parts = _extract_parts_from_order_soup(soup)
+    return {"order_number": order_number, "data": data, "parts": parts}
+
+
+def _get_existing_order_numbers(conn, order_numbers):
+    cleaned = sorted({(o or "").strip() for o in order_numbers if (o or "").strip()})
+    if not cleaned:
+        return set()
+
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT order_number FROM comenzi WHERE order_number = ANY(%s)",
+        (cleaned,),
+    )
+    return {row["order_number"] for row in cursor.fetchall()}
+
+
+def prepare_unimported_orders(conn, session: requests.Session, order_entries, limit: int):
+    if not order_entries:
+        raise ValueError("Nu am găsit linkuri de comenzi în pagina de orders.")
+
+    limited_entries = order_entries[:limit]
+    existing_orders = _get_existing_order_numbers(
+        conn,
+        [entry.get("order_number") for entry in limited_entries if isinstance(entry, dict)],
+    )
+
+    unimported = []
+    existing_count = 0
+    errors = []
+
+    for entry in limited_entries:
+        link = entry["link"] if isinstance(entry, dict) else str(entry)
+        created_at = entry.get("created_at") if isinstance(entry, dict) else None
+        listed_number = entry.get("order_number") if isinstance(entry, dict) else None
+
+        if listed_number and listed_number in existing_orders:
+            existing_count += 1
+            continue
+
+        try:
+            order_resp = session.get(link, timeout=30)
+            order_resp.raise_for_status()
+            details = parse_order_html_details(order_resp.text)
+            if details["order_number"] in existing_orders:
+                existing_count += 1
+                continue
+
+            unimported.append(
+                {
+                    "order_number": details["order_number"],
+                    "created_at": created_at or details["data"],
+                    "link": link,
+                    "parts": details["parts"],
+                    "html": order_resp.text,
+                }
+            )
+        except Exception as exc:
+            errors.append(f"{link} -> {exc}")
+
+    return {
+        "total_links": len(limited_entries),
+        "unimported_orders": unimported,
+        "existing": existing_count,
+        "errors": errors,
+    }
+
+
+def import_selected_orders(conn, prepared_orders, selected_order_numbers):
+    selected = set(selected_order_numbers or [])
+    if not selected:
+        raise ValueError("Selectează cel puțin o comandă pentru import.")
+
+    created_orders = 0
+    existing_orders = 0
+    updated_orders = 0
+    total_parts = 0
+    errors = []
+
+    for entry in prepared_orders:
+        if entry["order_number"] not in selected:
+            continue
+
+        try:
+            _, added, state = parse_html_and_insert(
+                conn,
+                entry["html"],
+                forced_order_date=entry.get("created_at"),
+            )
+            if state == "exists":
+                existing_orders += 1
+            elif state == "updated":
+                updated_orders += 1
+            else:
+                created_orders += 1
+                total_parts += added
+        except Exception as exc:
+            errors.append(f"{entry['order_number']} -> {exc}")
+
+    return {
+        "selected": len(selected),
+        "imported": created_orders,
+        "existing": existing_orders,
+        "updated": updated_orders,
+        "parts": total_parts,
+        "errors": errors,
+    }
+
+
+def parse_html_and_insert(conn, html_text: str, forced_order_date: Optional[str] = None):
+    cursor = conn.cursor()
+    details = parse_order_html_details(html_text)
+    order_number = details["order_number"]
 
     cursor.execute(
         "SELECT id, data_plasare FROM comenzi WHERE order_number = %s",
@@ -819,7 +983,7 @@ def parse_html_and_insert(conn, html_text: str, forced_order_date: Optional[str]
             return order_number, 0, "updated"
         return order_number, 0, "exists"
 
-    data = forced_order_date or _extract_order_placed_date(soup)
+    data = forced_order_date or details["data"]
     cursor.execute(
         """
         INSERT INTO comenzi (order_number, data_plasare, tip)
@@ -830,37 +994,25 @@ def parse_html_and_insert(conn, html_text: str, forced_order_date: Optional[str]
     )
     comanda_id = cursor.fetchone()["id"]
 
-    table = soup.find("table", class_="views-table")
     added = 0
-    if table and table.find("tbody"):
-        for row in table.find("tbody").find_all("tr"):
-            cols = row.find_all("td")
-            if len(cols) >= 4:
-                raw_desc = cols[1].get_text(" ", strip=True)
-                disponibilitate = _extract_availability(raw_desc)
-                nume = raw_desc.replace("sufficient stock", "").strip()
-                cod_match = re.search(r"\(([\w-]+)\)", nume)
-                cod = cod_match.group(1) if cod_match else ""
-
-                qty_cell = cols[3].get_text(" ", strip=True) if len(cols) > 3 else "1"
-                try:
-                    cant = float(re.sub(r"[^0-9.,-]", "", qty_cell).replace(",", ".") or "1")
-                except (ValueError, TypeError):
-                    cant = 1.0
-
-                price_text = " ".join(c.get_text(" ", strip=True) for c in cols)
-                pret = _extract_price_from_text(price_text)
-
-                cursor.execute(
-                    """
-                    INSERT INTO piese (
-                        comanda_id, nume_piesa, cod, cantitate, status, pret_unitar, disponibilitate_plasare
-                    )
-                    VALUES (%s, %s, %s, %s, 'asteptata', %s, %s)
-                    """,
-                    (comanda_id, nume, cod, cant, pret, disponibilitate),
-                )
-                added += 1
+    for part in details["parts"]:
+        cursor.execute(
+            """
+            INSERT INTO piese (
+                comanda_id, nume_piesa, cod, cantitate, status, pret_unitar, disponibilitate_plasare
+            )
+            VALUES (%s, %s, %s, %s, 'asteptata', %s, %s)
+            """,
+            (
+                comanda_id,
+                part["nume"],
+                part["cod"],
+                part["cantitate"],
+                part["pret"],
+                part["disponibilitate"],
+            ),
+        )
+        added += 1
 
     conn.commit()
     return order_number, added, "created"
@@ -1412,40 +1564,116 @@ def main():
                     height=110,
                 )
 
-            sync_submit = st.form_submit_button("Import comenzi")
+            sync_submit = st.form_submit_button("Încarcă lista comenzilor neimportate")
 
         if sync_submit:
-            with st.spinner("Import în curs..."):
+            with st.spinner("Se citește lista comenzilor..."):
                 try:
                     if sync_mode == "Login direct (fără CAPTCHA)":
                         if not sync_user or not sync_pass:
                             raise ValueError("Completează user și parolă.")
-                        result = import_orders_from_account(
-                            conn,
+                        session, _ = login_and_fetch_orders_html(
                             sync_user,
                             sync_pass,
-                            orders_url=sync_orders_url.strip() or ORDERS_URL,
-                            limit=int(sync_limit),
+                            sync_orders_url.strip() or ORDERS_URL,
                         )
                     else:
-                        result = import_orders_from_cookie(
-                            conn,
+                        if not sync_cookie.strip():
+                            raise ValueError("Completează cookie-ul de sesiune pentru import prin cookie.")
+                        session, _ = fetch_orders_html_with_cookie(
+                            sync_orders_url.strip() or ORDERS_URL,
                             sync_cookie,
-                            orders_url=sync_orders_url.strip() or ORDERS_URL,
-                            limit=int(sync_limit),
                         )
 
-                    st.success(
-                        f"Import gata. Noi: {result['imported']} | Actualizate: {result.get('updated', 0)} | "
-                        f"Existente: {result['existing']} | Piese noi: {result['parts']} | "
-                        f"Linkuri detectate: {result['total_links']}"
+                    order_entries = _collect_order_links_from_pages(
+                        session,
+                        sync_orders_url.strip() or ORDERS_URL,
+                        limit=int(sync_limit),
+                        max_pages=120,
                     )
-                    if result["errors"]:
-                        st.warning("Unele comenzi nu au putut fi importate:")
-                        for err in result["errors"][:10]:
+                    prepared = prepare_unimported_orders(conn, session, order_entries, int(sync_limit))
+                    st.session_state["sync_prepared_orders"] = prepared["unimported_orders"]
+                    st.session_state["sync_prepared_meta"] = {
+                        "total_links": prepared["total_links"],
+                        "existing": prepared["existing"],
+                        "errors": prepared["errors"],
+                    }
+
+                    st.success(
+                        f"Listă încărcată. Neimportate: {len(prepared['unimported_orders'])} | "
+                        f"Deja importate: {prepared['existing']} | Linkuri detectate: {prepared['total_links']}"
+                    )
+                    if prepared["errors"]:
+                        st.warning("Unele comenzi nu au putut fi citite:")
+                        for err in prepared["errors"][:10]:
                             st.write(f"- {err}")
                 except Exception as exc:
                     st.error(f"Eroare la sincronizare: {exc}")
+
+        prepared_orders = st.session_state.get("sync_prepared_orders", [])
+        if prepared_orders:
+            st.markdown("#### Comenzi neimportate detectate (prin cookie/login)")
+            st.dataframe(
+                [
+                    {
+                        "Comandă": o["order_number"],
+                        "Data": o.get("created_at") or "-",
+                        "Nr piese": len(o.get("parts", [])),
+                    }
+                    for o in prepared_orders
+                ],
+                use_container_width=True,
+            )
+
+            order_numbers = [o["order_number"] for o in prepared_orders]
+            order_by_number = {o["order_number"]: o for o in prepared_orders}
+
+            selected_numbers = st.multiselect(
+                "Alege comenzile pe care vrei să le imporți",
+                order_numbers,
+                default=order_numbers,
+                key="sync_selected_orders",
+            )
+
+            with st.expander("Preview piese pe comandă (click pe comandă)", expanded=False):
+                order_choice = st.selectbox("Alege comanda", order_numbers, index=0, key="sync_preview_choice")
+                chosen_order = order_by_number[order_choice]
+                st.caption(f"Comanda {chosen_order['order_number']} are {len(chosen_order.get('parts', []))} piese.")
+                st.dataframe(
+                    [
+                        {
+                            "Cod": part.get("cod", ""),
+                            "Denumire": part.get("nume", ""),
+                            "Cantitate": part.get("cantitate", 0),
+                            "Preț": part.get("pret", None),
+                            "Disponibilitate": part.get("disponibilitate", ""),
+                        }
+                        for part in chosen_order.get("parts", [])
+                    ],
+                    use_container_width=True,
+                )
+
+            if st.button("Importă comenzile selectate", type="primary", use_container_width=True):
+                with st.spinner("Import în curs..."):
+                    try:
+                        result = import_selected_orders(conn, prepared_orders, selected_numbers)
+                        st.success(
+                            f"Import gata. Selectate: {result['selected']} | Noi: {result['imported']} | "
+                            f"Actualizate: {result.get('updated', 0)} | Existente: {result['existing']} | "
+                            f"Piese noi: {result['parts']}"
+                        )
+                        if result["errors"]:
+                            st.warning("Unele comenzi nu au putut fi importate:")
+                            for err in result["errors"][:10]:
+                                st.write(f"- {err}")
+
+                        imported_numbers = set(selected_numbers)
+                        remaining = [o for o in prepared_orders if o["order_number"] not in imported_numbers]
+                        st.session_state["sync_prepared_orders"] = remaining
+                    except Exception as exc:
+                        st.error(f"Eroare la importul selectat: {exc}")
+        elif st.session_state.get("sync_prepared_meta") is not None:
+            st.info("Nu există comenzi noi de importat. Toate comenzile detectate sunt deja importate.")
     else:
         st.info("Ești logat ca utilizator simplu. Doar admin poate importa comenzi sau încărca fișiere.")
 
